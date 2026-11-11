@@ -1,0 +1,7 @@
+# Test override: synthetic credential and fake upstream, never real GitHub.
+services:
+  broker:
+    command: ["python", "/opt/secret-guard/isolation/fake_broker.py"]
+    environment:
+      SG_APPROVAL_PORT: "${SG_APPROVAL_PORT:-8766}"
+      SG_TEST_CANARY: "${SG_TEST_CANARY:?set by tests}"

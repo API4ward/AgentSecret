@@ -20,3 +20,19 @@
 本机 editable 安装生成的 `.pth` 文件带 macOS hidden 属性，Python 3.14 跳过加载；因此 README 使用标准 wheel 安装，避免依赖 editable finder。源码修改后需要重新安装才能更新已安装 CLI；从项目目录以 `python -m secret_guard.cli` 运行可直接使用源码。
 
 测试不使用真实用户凭据，临时演示设备已撤销，演示 daemon 已停止。真实 GitHub/TLS/跨设备手机联调、真实 Codex 工具调用、OS worker 隔离与严格消息入口矩阵 **NOT_RUN / 尚未实现**；详见 [实现状态](implementation.md)。以上协议测试不能视为完整产品安全认证。
+
+## 2026-11-11 OS 隔离验收
+
+环境：macOS 26.3、Docker 29.2.0（Docker Desktop，arm64）、宿主 Python 3.14.6、镜像 python:3.12-slim。
+
+| 检查 | 结果 | 证据范围 |
+|---|---|---|
+| `python -m unittest discover -v` | **36/36 PASS** | 原有 26 项加 `tests/test_isolation.py` 10 项 |
+| 恶意 worker 探针（无网络） | PASS，0 项突破 | 14 项真实尝试：读 broker 状态、全盘扫 canary、进程环境、挂载、篡改、提权、审批端口、直接出网、socket 越权 |
+| 恶意 worker 探针（出网代理） | PASS，0 项突破 | 另加 12 个白名单外 CONNECT/GET 请求全部被拒 |
+| 对照组：同一探针在 broker 容器内 | 读到 vault key、数据库和明文标记 | 证明探针能发现可读状态 |
+| 两阶段闭环跨边界 | PASS | worker 内 MCP 经 socket，宿主设备密钥经 127.0.0.1 发布端口签名，假上游 |
+| worker 退出后 task 撤销、token 删除 | PASS | 数据库 `active=0`，任务目录为空 |
+| 白名单主机可用性 | PASS（手动） | `SG_EGRESS_ALLOW=example.com` 时经代理完成 TLS 握手；不在自动测试内 |
+
+全部使用合成 canary 和假上游。真实 agent（Codex/Claude）在 worker 内运行、清洗工作区、VM 级隔离 **NOT_RUN / 尚未实现**。

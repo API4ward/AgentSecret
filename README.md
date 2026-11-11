@@ -86,6 +86,18 @@ guard.operation_status({"operation_id":"…"})
 
 引用在任务内最长 8 小时，操作审批 2 分钟有效，task 最长 8 小时。凭据策略绑定 user、project、repo 和唯一固定 adapter。相同 pending 请求合并；拒绝在同一任务内保持，不因模型重试再弹窗。最多 20 个 pending/approved 请求。`unknown` 不会重执行，需要用户核对；如要重新申请，必须产生新的人工授权。
 
+## 隔离部署（broker 与 agent 分属不同容器）
+
+上面的本机流程中 broker 和 agent 同属一个用户，agent 可以直接读 vault。要让边界成立，用 `isolation/` 下的容器部署：broker 独占状态卷，每个任务的 agent 运行在无网络、非 root、只读根文件系统的 worker 容器里，只能通过一个 Unix socket 调用 agent API。
+
+```sh
+isolation/guardctl up
+isolation/guardctl broker secret-add github-ci --user alice --project payments --repo acme/payments
+isolation/guardctl run --user alice --project payments --workspace /absolute/path/project -- <agent 命令>
+```
+
+worker 内的 MCP 命令为 `python -m secret_guard.cli mcp --url "$SECRET_GUARD_URL" --token-file "$SECRET_GUARD_TOKEN_FILE"`。结构、出网白名单、绕过测试结果和不在保证范围内的事项见 [OS 隔离部署](docs/isolation.md)。
+
 ## 撤销与审计
 
 ```sh
@@ -102,4 +114,4 @@ guard.operation_status({"operation_id":"…"})
 
 已实现受支持 broker 路径中的凭据代理与精确操作授权；结果整体缓冲、校验后才返回。对登记值和常见 base64/hex/URL 编码进行泄漏检查，再通过极小结果 schema；这不构成任意编码检测保证。
 
-**尚未实现严格版**：清洗工作区、worker/broker OS 隔离、受控出网、输入/附件/原生工具输出过滤、Codex 内核及持久化/压缩/fork 适配。当前相同用户权限的 agent 仍可能读取 broker 文件或审批浏览器状态，不能声称“所有消息永不泄漏”或抵御已控制宿主/审批设备的攻击者。请以假凭据验证此原型；真实部署必须先建立设计文档规定的安全域。详见 [实现状态](docs/implementation.md)。
+**尚未实现严格版**：清洗工作区、输入/附件/原生工具输出过滤、Codex 内核及持久化/压缩/fork 适配。worker/broker OS 隔离与受控出网仅在[隔离部署](docs/isolation.md)下成立；不使用隔离部署时，相同用户权限的 agent 仍可能读取 broker 文件或审批浏览器状态，不能声称“所有消息永不泄漏”或抵御已控制宿主/审批设备的攻击者。请以假凭据验证此原型；真实部署必须先建立设计文档规定的安全域。详见 [实现状态](docs/implementation.md)。

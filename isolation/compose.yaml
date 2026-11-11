@@ -1,0 +1,68 @@
+# Trusted side of the boundary. Workers are NOT declared here: each task gets
+# its own container from `guardctl run`, with no network and no state volume.
+name: secret-guard
+
+services:
+  broker:
+    build:
+      context: ..
+      dockerfile: isolation/Dockerfile
+    image: secret-guard:isolated
+    user: sgbroker
+    command:
+      - secret-guard
+      - --state
+      - /var/lib/secret-guard
+      - serve
+      - --agent-socket
+      - /run/secret-guard/agent/agent.sock
+      - --container-approval-bind
+      - 0.0.0.0
+      - --approval-port
+      - "${SG_APPROVAL_PORT:-8766}"
+    ports:
+      # Host loopback only. Container and host port must match: the approval
+      # listener pins Host/Origin to 127.0.0.1:<port>.
+      - "127.0.0.1:${SG_APPROVAL_PORT:-8766}:${SG_APPROVAL_PORT:-8766}"
+    volumes:
+      - sg-state:/var/lib/secret-guard
+      - sg-agent:/run/secret-guard/agent
+      - sg-tasks:/run/secret-guard/tasks
+    networks: [broker-net]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/secret-guard/agent/agent.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Optional: the only way out for a worker started with `guardctl run --egress`.
+  egress:
+    profiles: [egress]
+    image: secret-guard:isolated
+    user: "65534:65534"
+    command: ["python", "/opt/secret-guard/isolation/egress_proxy.py"]
+    environment:
+      SG_EGRESS_ALLOW: "${SG_EGRESS_ALLOW:-}"
+    networks: [worker-net, egress-net]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    restart: unless-stopped
+
+networks:
+  broker-net: {}      # broker upstream (api.github.com) and the published approval port
+  egress-net: {}      # proxy upstream
+  worker-net:
+    internal: true    # no route out; only the egress proxy lives here
+
+volumes:
+  sg-state: {}        # vault key + database; mounted by the broker only
+  sg-agent: {}        # agent.sock; workers mount it read-only
+  sg-tasks: {}        # one sub-directory per task; a worker mounts only its own

@@ -35,8 +35,10 @@ def parser():
     s.add_argument("--approval-port", type=int, default=8766)
     s.add_argument("--cert")
     s.add_argument("--key")
+    s.add_argument("--agent-socket", help="Serve the agent API on this Unix socket instead of TCP (isolated worker domain)")
+    s.add_argument("--container-approval-bind", help="Bind address inside a broker container whose approval port is published to host loopback only")
     s = sub.add_parser("mcp")
-    s.add_argument("--url", default="http://127.0.0.1:8765")
+    s.add_argument("--url", default="http://127.0.0.1:8765", help="Broker agent API; unix:///absolute/path.sock inside an isolated worker")
     s.add_argument("--token-file", required=True)
     return p
 
@@ -80,7 +82,7 @@ def main():
             print(json.dumps(broker.activity(), indent=2))
         elif args.command == "serve":
             from .server import serve
-            serve(broker, args.host, args.agent_port, args.approval_port, args.cert, args.key)
+            serve(broker, args.host, args.agent_port, args.approval_port, args.cert, args.key, args.agent_socket, args.container_approval_bind)
     except KeyboardInterrupt:
         pass
     except GuardError as exc:

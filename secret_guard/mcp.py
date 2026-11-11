@@ -1,5 +1,7 @@
 """Task-specific newline JSON-RPC MCP stdio bridge. No vault dependency."""
+from http.client import HTTPConnection
 import json
+import socket
 import sys
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler
@@ -11,6 +13,31 @@ TOOLS = [
 ]
 
 
+class UnixConnection(HTTPConnection):
+    def __init__(self, path, timeout):
+        super().__init__("secret-guard-agent", timeout=timeout)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+def call_unix(path, route, token, args):
+    # Isolated worker: the broker is only reachable through a mounted socket.
+    # http.client never follows redirects, so task auth cannot be forwarded.
+    connection = UnixConnection(path, 20)
+    try:
+        connection.request("POST", route, json.dumps(args).encode(), {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+        data = connection.getresponse().read(1024 * 1024 + 1)
+    finally:
+        connection.close()
+    if len(data) > 1024 * 1024:
+        raise ValueError("response too large")
+    return json.loads(data)
+
+
 def call(url, token, name, args):
     routes = {"guard.request_reference": "/reference", "guard.github_workflow_runs": "/workflow", "guard.operation_status": "/status"}
     if name not in routes or not isinstance(args, dict):
@@ -19,6 +46,8 @@ def call(url, token, name, args):
     if name == "guard.github_workflow_runs":
         args.setdefault("limit", 10)
     parts = urlsplit(url)
+    if parts.scheme == "unix" and not parts.netloc and parts.path.startswith("/") and not parts.query and not parts.fragment:
+        return call_unix(parts.path, routes[name], token, args)
     if parts.scheme not in {"http", "https"} or parts.username or parts.password or parts.query or parts.fragment or parts.path not in {"", "/"}:
         raise ValueError("invalid broker")
     if parts.scheme == "http" and parts.hostname not in {"127.0.0.1", "localhost"}:
