@@ -38,7 +38,19 @@ def parser():
     s = sub.add_parser("mcp")
     s.add_argument("--url", default="http://127.0.0.1:8765")
     s.add_argument("--token-file", required=True)
+    s = sub.add_parser("claude-config", help="Write a per-task Claude Code --mcp-config file")
+    s.add_argument("--url", default="http://127.0.0.1:8765")
+    s.add_argument("--token-file", required=True)
+    s.add_argument("--out", required=True)
     return p
+
+
+def claude_mcp_config(token_file, url="http://127.0.0.1:8765"):
+    # Holds the token file path, never the token. PYTHONPATH lets the bridge
+    # start from any cwd, installed or not; Claude Code has no per-server cwd.
+    return {"mcpServers": {"secret_guard": {"type": "stdio", "command": sys.executable,
+            "args": ["-m", "secret_guard.cli", "mcp", "--url", url, "--token-file", str(Path(token_file).resolve())],
+            "env": {"PYTHONPATH": str(Path(__file__).resolve().parent.parent)}}}}
 
 
 def main():
@@ -47,6 +59,15 @@ def main():
         # The bridge deliberately does not open the broker database or vault.
         from .mcp import run
         run(args.url, Path(args.token_file).read_text().strip())
+        return
+    if args.command == "claude-config":
+        # No broker access either; refuse overwrite like task-create.
+        if not Path(args.token_file).is_file():
+            sys.exit("Token file not found; run task-create first.")
+        fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(claude_mcp_config(args.token_file, args.url), f, indent=2)
+        print(json.dumps({"mcp_config": str(Path(args.out).resolve())}))
         return
     from .broker import Broker, GuardError
     try:

@@ -14,6 +14,7 @@
 | 固定 GitHub adapter | workflow runs GET，Actions read，schema 白名单 | 已实现；真实 GitHub 凭据联调未运行 |
 | 结果过滤与审计 | buffer ≤1 MiB、精确/常见编码匹配、固定结果字段、无异常回显 | 已实现支持路径；非任意编码保证 |
 | MCP 接入 | 3 个具名工具，STDIO JSON-RPC | 已实现；线协议与本地 HTTP 测试通过；真实 Codex 调用未运行 |
+| Claude Code 接入 | `claude-config` 生成按次 `--mcp-config`；`examples/claude_e2e.py` | 已实现；Claude Code 2.1.311 headless 假凭据闭环通过，子 agent 共享 task 身份已确认；见 [claude-code.md](claude-code.md) |
 | 故障恢复 | durable executing → unknown；无自动重试 | 已实现 |
 | 策略和撤销 | user/project/repo、task/device/secret/operation 撤销、版本变更失效 | 已实现 |
 | OS/网络边界、清洗工作区 | 设计第 9 节第二阶段 | 尚未实现 |
@@ -35,6 +36,8 @@ task token 是独立运行的代理身份凭据，其 hash 存库；设备 sessi
 ## 测试方法
 
 `python -m unittest discover -v` 覆盖：两阶段闭环、加密存储、无明文返回、引用与 use 过期、登录/审批重放、伪造批准、跨任务引用、跨用户/项目与仓库策略、拒绝合并、并发与跨 broker 原子消费、完整冻结参数篡改、adapter 摘要改变、凭据轮换、四种撤销、反射秘密及常见编码、错误消息清洗、崩溃 unknown 恢复、状态查询不执行、URL 注入、HTTP 端口分离/额外批准字段/Origin 拒绝、远程 TLS 要求与 MCP 线协议。
+
+2026-11-11 补充：MCP bridge 重定向不再转发 task token（2026-10-24 审查 F2），新增 302/307 回归测试与 `claude-config` 测试，共 28 项。
 
 测试结果记录在 [validation.md](validation.md)。这些是假凭据、假 GitHub transport 的协议测试，不能代替独立目标服务观察或严格运行环境测试。真实 Codex MCP、真实 GitHub 网络、手机跨设备 HTTPS、硬件用户验证、原生输入/工具/压缩/fork 等验收均未运行。
 

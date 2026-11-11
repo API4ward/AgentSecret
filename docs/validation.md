@@ -20,3 +20,17 @@
 本机 editable 安装生成的 `.pth` 文件带 macOS hidden 属性，Python 3.14 跳过加载；因此 README 使用标准 wheel 安装，避免依赖 editable finder。源码修改后需要重新安装才能更新已安装 CLI；从项目目录以 `python -m secret_guard.cli` 运行可直接使用源码。
 
 测试不使用真实用户凭据，临时演示设备已撤销，演示 daemon 已停止。真实 GitHub/TLS/跨设备手机联调、真实 Codex 工具调用、OS worker 隔离与严格消息入口矩阵 **NOT_RUN / 尚未实现**；详见 [实现状态](implementation.md)。以上协议测试不能视为完整产品安全认证。
+
+## 2026-11-11 Claude Code 接入
+
+环境：macOS、Python 3.14、Claude Code 2.1.311，实际模型 `claude-sonnet-5-5`。分支 `claude-support`。
+
+| 检查 | 结果 | 证据范围 |
+|---|---|---|
+| `python -m unittest discover` | **28/28 PASS** | 原 26 项加 MCP 重定向回归、`claude-config` 生成与启动 |
+| 重定向回归测试在修复前的 `mcp.py` 上运行 | FAIL（符合预期） | 证明测试能检出 2026-10-24 审查的 F2 |
+| `python -m examples.claude_e2e` | PASS | 真实 `claude -p`，按次 `--mcp-config --strict-mcp-config`；合成凭据、假 transport、合成审批设备自动签名 |
+| `python -m examples.claude_e2e --subagent` | PASS | 子 agent 用父会话的引用发起操作；broker 审计只有一个 task |
+| 合成凭据、task token 不在 Claude Code 输出中 | PASS | 两次运行的完整 stream-json 与 stderr |
+
+结果摘要见 [reviews/2026-11-11-claude-code-e2e](reviews/2026-11-11-claude-code-e2e/)，分析见 [claude-code.md](claude-code.md)。人在审批页面上批准、恢复/分叉/后台 agent、hooks、真实 GitHub 均 **NOT_RUN**。运行未修改全局 Claude Code 配置；它加载了本机用户已有的 Claude Code 设置和登录。

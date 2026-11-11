@@ -1,6 +1,6 @@
 # Secret Guard for Codex
 
-可运行的 **MCP 兼容版 v0.1**：受信任 broker 保存凭据，Codex 仅持有任务 token 和批准后获得的不透明引用。独立审批设备对冻结操作签名，broker 在执行前复验签名、策略、凭据版本和 adapter 源码摘要，并原子消费一次性许可。
+可运行的 **MCP 兼容版 v0.1**：受信任 broker 保存凭据，agent（Codex 或 Claude Code）仅持有任务 token 和批准后获得的不透明引用。独立审批设备对冻结操作签名，broker 在执行前复验签名、策略、凭据版本和 adapter 源码摘要，并原子消费一次性许可。
 
 实现依据：[产品设计](codex-secret-guard-product-design.md)。本版覆盖其第一条只读 GitHub 闭环；[实现与验收状态](docs/implementation.md)说明已验证和未实现的部分。
 
@@ -85,6 +85,20 @@ guard.operation_status({"operation_id":"…"})
 ```
 
 引用在任务内最长 8 小时，操作审批 2 分钟有效，task 最长 8 小时。凭据策略绑定 user、project、repo 和唯一固定 adapter。相同 pending 请求合并；拒绝在同一任务内保持，不因模型重试再弹窗。最多 20 个 pending/approved 请求。`unknown` 不会重执行，需要用户核对；如要重新申请，必须产生新的人工授权。
+
+## 接入 Claude Code
+
+Claude Code 使用同一个 MCP bridge。每次运行单独建 task，并用 `claude-config` 生成只供这一次运行使用的配置：
+
+```sh
+.venv/bin/secret-guard task-create --user alice --project payments \
+  --agent claude-code --token-file /absolute/path/run-01.token
+.venv/bin/secret-guard claude-config \
+  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.mcp.json
+claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config
+```
+
+不要用 `claude mcp add` 或仓库 `.mcp.json` 做全局登记。Claude Code 中工具名为 `mcp__secret_guard__guard_request_reference` 等。子 agent 与父会话共用同一个 task 身份，权限规则和 hooks 不构成安全边界。已用 Claude Code 2.1.311 和假凭据跑通闭环，详见 [Claude Code 接入与保证范围](docs/claude-code.md)。
 
 ## 撤销与审计
 
