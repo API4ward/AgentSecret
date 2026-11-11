@@ -1,0 +1,5 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Secret Guard · 审批</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body><main><header><span class="badge">SECRET GUARD</span><h1>由你决定凭据的使用</h1><p>引用授权与具体操作授权分别确认。批准仅对卡片中的冻结请求有效。</p></header>
+<section><h2>审批设备</h2><p id="device-state">尚未连接</p><button id="pair">生成设备密钥</button><button id="connect">连接已注册设备</button><details><summary>桌面配对信息</summary><p>在可信桌面保存以下公钥为 device.json，核对设备编号后，通过 device-register 命令登记。此页面不能注册自己。</p><pre id="pairing"></pre></details><p class="hint">此原型使用浏览器中的不可导出密钥，需要手动点击批准；尚未实现 passkey 用户验证或原生手机安全区。</p></section>
+<section><div class="row"><h2>待审批</h2><button id="refresh">刷新</button></div><div id="requests"><p>先连接设备，再获取待审批请求。</p></div></section><p id="message" role="status"></p></main></body></html>

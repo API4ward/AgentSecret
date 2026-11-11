@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-secret-guard"
+version = "0.1.0"
+description = "Two-stage credential broker and task-bound MCP bridge"
+requires-python = ">=3.11"
+dependencies = ["cryptography==46.0.5"]
+
+[project.scripts]
+secret-guard = "secret_guard.cli:main"
+
+[tool.setuptools.package-data]
+secret_guard = ["web/*"]
+
+[tool.setuptools.packages.find]
+include = ["secret_guard*"]
