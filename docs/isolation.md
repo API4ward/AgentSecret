@@ -96,4 +96,4 @@ isolation/guardctl run --egress --user alice --project payments -- <agent 命令
 - **白名单内的主机可以收到 agent 发出的任何数据**；agent 自己的模型 API 凭据在 worker 内。出网控制是主机级别，不检查内容。
 - **任务身份粒度是一个 worker 容器**，不能区分容器内的 thread、fork 或子 agent。
 - 审批浏览器 profile 在宿主上，worker 看不到；宿主上同用户的其他进程仍可读取。
-- 2026-10-24 审查确认的 TLS 握手阻塞和 TCP 路径上的 MCP 重定向问题未在此处修改。socket 路径使用不跟随重定向的 `http.client`。
+- 2026-10-24 审查确认的 TLS 握手阻塞未在此处修改。MCP 重定向转发 task token 的问题已在 Claude Code 接入中修复（TCP 路径）；socket 路径使用不跟随重定向的 `http.client`。

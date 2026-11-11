@@ -314,6 +314,57 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(len(results[1]["result"]["tools"]), 3)
         self.assertNotIn("approve", [t["name"] for t in results[1]["result"]["tools"]])
 
+    def test_mcp_bridge_does_not_follow_redirects_with_task_token(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from secret_guard.mcp import call
+        seen = []
+        class Target(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"{}")
+            do_POST = do_GET
+        target = HTTPServer(("127.0.0.1", 0), Target)
+        for code in (302, 307):
+            class Source(BaseHTTPRequestHandler):
+                def log_message(self, *args): pass
+                def do_POST(self):
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                    self.send_response(code); self.send_header("Location", f"http://127.0.0.1:{target.server_port}/status"); self.send_header("Content-Length", "0"); self.end_headers()
+            source = HTTPServer(("127.0.0.1", 0), Source)
+            for s in (source, target):
+                threading.Thread(target=s.handle_request, daemon=True).start()
+            try:
+                with self.assertRaises(HTTPError) as caught:
+                    call(f"http://127.0.0.1:{source.server_port}", "SYNTHETIC_TASK_TOKEN", "guard.operation_status", {"operation_id": "op_x"})
+                caught.exception.close()
+            finally:
+                # Unblock the target's single handle_request if nothing reached it.
+                try: urlopen(f"http://127.0.0.1:{target.server_port}/", timeout=2).close()
+                except Exception: pass
+                source.server_close()
+            self.assertNotIn("Bearer SYNTHETIC_TASK_TOKEN", seen)
+        target.server_close()
+
+    def test_claude_mcp_config_references_token_file_only(self):
+        from secret_guard.cli import claude_mcp_config
+        tokenfile = self.tmp.name + "/run.token"
+        with open(tokenfile, "w") as f:
+            f.write(self.t["token"] + "\n")
+        out = self.tmp.name + "/mcp.json"
+        subprocess.run([sys.executable, "-m", "secret_guard.cli", "claude-config", "--token-file", tokenfile, "--out", out], check=True, capture_output=True)
+        from pathlib import Path
+        text = Path(out).read_text()
+        self.assertNotIn(self.t["token"], text)
+        server = json.loads(text)["mcpServers"]["secret_guard"]
+        self.assertEqual(server, claude_mcp_config(tokenfile)["mcpServers"]["secret_guard"])
+        # Refuses to overwrite an existing per-task config.
+        self.assertNotEqual(subprocess.run([sys.executable, "-m", "secret_guard.cli", "claude-config", "--token-file", tokenfile, "--out", out], capture_output=True).returncode, 0)
+        # The generated command starts a working bridge from an unrelated cwd.
+        requests = [{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}, {"jsonrpc":"2.0","id":2,"method":"tools/list"}]
+        p = subprocess.run([server["command"], *server["args"]], env=server["env"], cwd=self.tmp.name, input="\n".join(json.dumps(r) for r in requests)+"\n", text=True, capture_output=True, check=True)
+        self.assertEqual(len(json.loads(p.stdout.splitlines()[1])["result"]["tools"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

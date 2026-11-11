@@ -4,13 +4,18 @@ import json
 import socket
 import sys
 from urllib.parse import urlsplit
-from urllib.request import Request, build_opener, ProxyHandler
+from urllib.request import HTTPRedirectHandler, Request, build_opener, ProxyHandler
 
 TOOLS = [
     {"name": "guard.request_reference", "description": "Request task-only credential reference approval. Return pending; poll operation_status. Never returns a secret.", "inputSchema": {"type": "object", "properties": {"alias": {"type": "string"}}, "required": ["alias"], "additionalProperties": False}},
     {"name": "guard.github_workflow_runs", "description": "Request one signed approval to read a policy-allowed GitHub repository's workflow status. Fixed GitHub destination; no execution before approval.", "inputSchema": {"type": "object", "properties": {"ref": {"type": "string"}, "repo": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}}, "required": ["ref", "repo"], "additionalProperties": False}},
     {"name": "guard.operation_status", "description": "Read operation state/result. Does not execute or retry; unknown requires human reconciliation.", "inputSchema": {"type": "object", "properties": {"operation_id": {"type": "string"}}, "required": ["operation_id"], "additionalProperties": False}},
 ]
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *unused):
+        return None
 
 
 class UnixConnection(HTTPConnection):
@@ -52,14 +57,10 @@ def call(url, token, name, args):
         raise ValueError("invalid broker")
     if parts.scheme == "http" and parts.hostname not in {"127.0.0.1", "localhost"}:
         raise ValueError("TLS required")
-    opener = build_opener(ProxyHandler({}))
-    request = Request(url.rstrip("/") + routes[name], data=json.dumps(args).encode(), headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
     # Broker never redirects; reject redirects instead of forwarding task auth.
-    from urllib.request import HTTPRedirectHandler
-    class NoRedirect(HTTPRedirectHandler):
-        def redirect_request(self, *unused):
-            return None
-    opener.add_handler(NoRedirect())
+    # Passed to build_opener so it replaces the default redirect handler.
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    request = Request(url.rstrip("/") + routes[name], data=json.dumps(args).encode(), headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
     with opener.open(request, timeout=20) as response:
         data = response.read(1024 * 1024 + 1)
         if len(data) > 1024 * 1024:
