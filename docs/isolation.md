@@ -2,6 +2,8 @@
 
 日期：2026-11-11。对应设计第 4 节信任边界、第 9 节第二阶段中的“凭据和 worker 隔离、受控出网、假凭据绕过测试”，以及第 10 节验收表的第 2、3、6 行。清洗工作区和严格消息保护仍未实现。
 
+**这是可选模式。** 不启用时，`secret-guard serve` 和 MCP bridge 仍按 README 的本机 TCP 流程工作，默认参数和行为不变；只有显式传入 `--agent-socket`、`--container-approval-bind` 或 `unix://` URL 才会走本文的路径。没有 Docker 时，`tests/test_isolation.py` 中的容器测试自动跳过。不启用隔离时，README“保证范围”一节的限制照旧适用。
+
 ## 机制选择
 
 | 方案 | 结论 | 原因 |

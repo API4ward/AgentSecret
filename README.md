@@ -86,9 +86,9 @@ guard.operation_status({"operation_id":"…"})
 
 引用在任务内最长 8 小时，操作审批 2 分钟有效，task 最长 8 小时。凭据策略绑定 user、project、repo 和唯一固定 adapter。相同 pending 请求合并；拒绝在同一任务内保持，不因模型重试再弹窗。最多 20 个 pending/approved 请求。`unknown` 不会重执行，需要用户核对；如要重新申请，必须产生新的人工授权。
 
-## 隔离部署（broker 与 agent 分属不同容器）
+## 可选：隔离部署（broker 与 agent 分属不同容器）
 
-上面的本机流程中 broker 和 agent 同属一个用户，agent 可以直接读 vault。要让边界成立，用 `isolation/` 下的容器部署：broker 独占状态卷，每个任务的 agent 运行在无网络、非 root、只读根文件系统的 worker 容器里，只能通过一个 Unix socket 调用 agent API。
+隔离部署是可选模式，不需要 Docker 也能按上面的本机流程使用全部功能，默认行为没有变化。区别在于保证范围：本机流程中 broker 和 agent 同属一个用户，agent 可以直接读 vault。需要这条边界时，改用 `isolation/` 下的容器部署：broker 独占状态卷，每个任务的 agent 运行在无网络、非 root、只读根文件系统的 worker 容器里，只能通过一个 Unix socket 调用 agent API。
 
 ```sh
 isolation/guardctl up
