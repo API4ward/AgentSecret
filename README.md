@@ -94,11 +94,13 @@ Claude Code 使用同一个 MCP bridge。每次运行单独建 task，并用 `cl
 .venv/bin/secret-guard task-create --user alice --project payments \
   --agent claude-code --token-file /absolute/path/run-01.token
 .venv/bin/secret-guard claude-config \
-  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.mcp.json
-claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config
+  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.mcp.json \
+  --settings-out /absolute/path/run-01.settings.json
+claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config \
+  --settings /absolute/path/run-01.settings.json
 ```
 
-不要用 `claude mcp add` 或仓库 `.mcp.json` 做全局登记。Claude Code 中工具名为 `mcp__secret_guard__guard_request_reference` 等。子 agent 与父会话共用同一个 task 身份，权限规则和 hooks 不构成安全边界。已用 Claude Code 2.1.311 和假凭据跑通闭环，详见 [Claude Code 接入与保证范围](docs/claude-code.md)。
+不要用 `claude mcp add` 或仓库 `.mcp.json` 做全局登记。Claude Code 中工具名为 `mcp__secret_guard__guard_request_reference` 等。`--settings-out` 生成的设置文件带有 PreToolUse hook，阻止 Claude 用 Read、Grep、Bash 等自带工具读取 broker 状态目录、token 文件和可信 CLI；MCP 只是调用通道，防读取靠这个 hook。token 和状态目录要放在工作区之外。hook 是同账户下的字符串检查，挡不住运行时拼出的路径，这条保证需要隔离部署。子 agent 与父会话共用同一个 task 身份。已用 Claude Code 2.1.311 和假凭据跑通闭环，详见 [Claude Code 接入与保证范围](docs/claude-code.md)。
 
 ## 可选：隔离部署（broker 与 agent 分属不同容器）
 

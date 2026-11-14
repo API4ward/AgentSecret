@@ -3,6 +3,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 
 
@@ -44,6 +45,8 @@ def parser():
     s.add_argument("--url", default="http://127.0.0.1:8765")
     s.add_argument("--token-file", required=True)
     s.add_argument("--out", required=True)
+    s.add_argument("--settings-out", help="Also write a --settings file whose PreToolUse hook keeps Claude's own tools away from broker state and the token")
+    s.add_argument("--protect", action="append", default=[], help="Extra path the hook must refuse, e.g. the approval browser profile (repeatable)")
     return p
 
 
@@ -53,6 +56,22 @@ def claude_mcp_config(token_file, url="http://127.0.0.1:8765"):
     return {"mcpServers": {"secret_guard": {"type": "stdio", "command": sys.executable,
             "args": ["-m", "secret_guard.cli", "mcp", "--url", url, "--token-file", str(Path(token_file).resolve())],
             "env": {"PYTHONPATH": str(Path(__file__).resolve().parent.parent)}}}}
+
+
+def claude_settings(protect):
+    # Guardrail, not a boundary: the hook runs as the agent's own OS user.
+    protect = [str(Path(p).expanduser().resolve()) for p in protect]
+    hook = [sys.executable, "-I", str(Path(__file__).resolve().with_name("claude_hook.py"))]
+    command = shlex.join(hook + [x for p in protect for x in ("--protect", p)])
+    deny = [f"{tool}(/{p}{suffix})" for p in protect for tool in ("Read", "Edit") for suffix in ("", "/**")]
+    return {"permissions": {"deny": deny},
+            "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 10}]}]}}
+
+
+def exclusive_json(path, value):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(value, f, indent=2)
 
 
 def main():
@@ -66,10 +85,14 @@ def main():
         # No broker access either; refuse overwrite like task-create.
         if not Path(args.token_file).is_file():
             sys.exit("Token file not found; run task-create first.")
-        fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(claude_mcp_config(args.token_file, args.url), f, indent=2)
-        print(json.dumps({"mcp_config": str(Path(args.out).resolve())}))
+        exclusive_json(args.out, claude_mcp_config(args.token_file, args.url))
+        written = {"mcp_config": str(Path(args.out).resolve())}
+        if args.settings_out:
+            # The package directory is protected so the hook cannot be edited away mid-session.
+            protect = [args.state, args.token_file, args.out, args.settings_out, Path(__file__).resolve().parent, *args.protect]
+            exclusive_json(args.settings_out, claude_settings(protect))
+            written["settings"] = str(Path(args.settings_out).resolve())
+        print(json.dumps(written))
         return
     from .broker import Broker, GuardError
     try:
