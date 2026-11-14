@@ -1,4 +1,5 @@
 import argparse
+import errno
 import getpass
 import json
 import os
@@ -165,7 +166,13 @@ def main():
             print(json.dumps(broker.activity(), indent=2))
         elif args.command == "serve":
             from .server import serve
-            serve(broker, args.host, args.agent_port, args.approval_port, args.cert, args.key, args.agent_socket, args.container_approval_bind)
+            try:
+                serve(broker, args.host, args.agent_port, args.approval_port, args.cert, args.key, args.agent_socket, args.container_approval_bind)
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE:
+                    raise
+                # Say so plainly: a bridge left on the default URL would send its task token to whatever owns that port.
+                sys.exit(f"Port {args.agent_port} or {args.approval_port} on {args.host} is already in use. Choose others with --agent-port/--approval-port and pass the same agent address as --url to claude-config/codex-config.")
     except KeyboardInterrupt:
         pass
     except GuardError as exc:

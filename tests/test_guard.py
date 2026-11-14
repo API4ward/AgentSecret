@@ -346,6 +346,15 @@ class GuardTests(unittest.TestCase):
             self.assertNotIn("Bearer SYNTHETIC_TASK_TOKEN", seen)
         target.server_close()
 
+    def test_serve_reports_port_in_use(self):
+        import socket
+        with socket.socket() as busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen()
+            p = subprocess.run([sys.executable, "-m", "secret_guard.cli", "--state", self.tmp.name + "/busy", "serve", "--agent-port", str(busy.getsockname()[1]), "--approval-port", "0"], capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("already in use", p.stderr)
+
     def test_claude_mcp_config_references_token_file_only(self):
         from secret_guard.cli import claude_mcp_config
         tokenfile = self.tmp.name + "/run.token"
