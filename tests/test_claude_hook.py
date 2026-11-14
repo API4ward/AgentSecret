@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -192,6 +193,46 @@ class ClaudeHookTests(unittest.TestCase):
         event = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "main.py"}, "cwd": str(self.work / "src")})
         self.assertEqual(subprocess.run(command, shell=True, input=event, capture_output=True, text=True).returncode, 0)
         self.assertNotEqual(subprocess.run(base + ["--settings-out", settings], capture_output=True).returncode, 0)
+
+    def test_codex_argv_command(self):
+        self.denied("shell", command=["bash", "-lc", f"cat {self.token}"])
+        self.denied("shell", command=["cat", "../run/run-01.token"])
+        self.allowed("shell", command=["bash", "-lc", "ls src"])
+
+    def codex_launcher(self):
+        out = str(self.token.parent / "codex-run")
+        subprocess.run([sys.executable, "-m", "secret_guard.cli", "--state", str(self.state), "codex-config",
+                        "--token-file", str(self.token), "--out", out], check=True, capture_output=True)
+        return out
+
+    def test_codex_config_launcher(self):
+        out = self.codex_launcher()
+        self.assertEqual(os.stat(out).st_mode & 0o777, 0o700)
+        text = Path(out).read_text()
+        self.assertNotIn("synthetic", text)
+        self.assertIn(f'"{self.state.resolve()}"="none"', text)
+        self.assertIn(f'"{self.token.resolve()}"="none"', text)
+        self.assertIn('default_permissions="secret_guard"', text)
+        self.assertIn("hooks.PreToolUse=", text)
+        self.assertIn("mcp_servers.secret_guard=", text)
+        self.assertEqual(subprocess.run(["sh", "-n", out]).returncode, 0)
+        again = subprocess.run([sys.executable, "-m", "secret_guard.cli", "codex-config", "--token-file", str(self.token), "--out", out], capture_output=True)
+        self.assertNotEqual(again.returncode, 0)
+
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("codex"), "needs the Codex CLI sandbox on macOS")
+    def test_codex_sandbox_denies_reads_however_the_path_is_built(self):
+        out = self.codex_launcher()
+        (self.work / "readme.txt").write_text("hello")
+        (self.work / "innocent").symlink_to(self.state)
+        def sandboxed(*command):
+            return subprocess.run([out, "sandbox", "--", *command], cwd=self.work, capture_output=True, text=True)
+        assembled = "+".join(f"chr({ord(c)})" for c in str(self.token))
+        for command in (["cat", str(self.state / "vault.key")], ["cat", str(self.token)], ["cat", "innocent/vault.key"],
+                        ["ls", str(self.state)], ["python3", "-c", f"print(open({assembled}).read())"]):
+            run = sandboxed(*command)
+            self.assertNotEqual(run.returncode, 0, command)
+            self.assertNotIn("synthetic", run.stdout + run.stderr)
+        self.assertEqual(sandboxed("cat", "readme.txt").stdout, "hello")
 
 
 if __name__ == "__main__":

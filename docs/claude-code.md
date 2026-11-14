@@ -74,6 +74,8 @@ broker 认的身份是 **持有该 token 的 MCP bridge 进程**，不是 Claude
 
 ## hook 防线：阻止 Claude 读取密钥
 
+Secret Guard 的保护分两层：第 1 层阻止 agent 读取本地密码，第 2 层通过 MCP 服务让 agent 使用密码。本节是 Claude Code 的第 1 层，Codex 的做法见 [codex.md](codex.md)。
+
 MCP 只提供了一条不接触明文的调用路径，它不能阻止 Claude 用自带的 Read、Grep、Bash 直接打开 broker 的文件。这件事由 hook 负责：`claude-config --settings-out` 生成的设置文件注册一个匹配全部工具的 PreToolUse hook（`secret_guard/claude_hook.py`），调用触及受保护路径时以退出码 2 拒绝，工具不会执行。
 
 受保护路径：broker 状态目录（全局参数 `--state`）、本次的 token 文件、生成的 MCP 配置和设置文件、`secret_guard` 包目录（防止会话中改掉 hook 自身），以及用 `--protect` 追加的路径，例如审批浏览器 profile 和设备密钥：

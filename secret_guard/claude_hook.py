@@ -1,4 +1,4 @@
-"""Claude Code PreToolUse hook: refuse tool calls that touch protected paths.
+"""PreToolUse hook for Claude Code and Codex (same wire format): refuse tool calls that touch protected paths.
 
 Stdlib only and run as a script with `python -I`, so nothing from the agent's
 cwd or PYTHONPATH is imported. This is a guardrail inside the agent's own OS
@@ -111,8 +111,12 @@ class Policy:
         cwd = event.get("cwd") or os.getcwd()
         if tool.startswith(ALLOWED_PREFIX):
             return None
-        if isinstance(args.get("command"), str):
-            return self.check_command(args["command"], cwd)
+        command = args.get("command")
+        if isinstance(command, list) and all(isinstance(c, str) for c in command):
+            # Codex may pass argv, e.g. ["bash", "-lc", "cat x"].
+            command = " ".join(command)
+        if isinstance(command, str):
+            return self.check_command(command, cwd)
         if tool == "Grep":
             return self.check_path(args.get("path") or ".", cwd, ancestors=True)
         if tool == "Glob":
