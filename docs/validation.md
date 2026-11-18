@@ -78,3 +78,7 @@ Grep、Glob 工具在该 headless 运行中不可用，对应规则只有单元�
 | 沙箱内读写工作区文件 | 正常 | |
 | hook 对 argv 形式的 `command` 参数 | PASS | 仅单元测试 |
 | 真实 `codex exec` 中 hook 触发、MCP 闭环 | **NOT_RUN** | 本机 Codex 工具执行不可用（`timed out negotiating with the code-mode host`），不带任何 Secret Guard 配置时同样失败 |
+
+## 2026-11-19 容器内真实 agent 端到端
+
+`e2e/run.sh` 在 Docker 容器里用真实的 Claude Code 2.1.311 和 codex-cli 0.166.0 跑两层用例，模型端点为宿主机 Ollama（`qwen3.6:35b-a3b`）。16 条全部通过：Claude Code 6 条，Codex 10 条（hook 和仅沙箱各一遍）。反向对照（关掉沙箱权限配置）被正确报告为泄漏。用例、发现的问题和限制见 [e2e-docker.md](e2e-docker.md)。
