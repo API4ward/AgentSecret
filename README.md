@@ -4,6 +4,8 @@
 
 实现依据：[产品设计](codex-secret-guard-product-design.md)。本版覆盖其第一条只读 GitHub 闭环；[实现与验收状态](docs/implementation.md)说明已验证和未实现的部分。
 
+> **拆分部署（2026-11-20）**：密码保存在审批端，server 只转发，注入工具在 agent 一侧执行。命令为 `agentsecret`，说明见 [docs/split-architecture.md](docs/split-architecture.md)。下文描述的单进程 broker 保持不变。
+
 ## 安装与测试
 
 需要 Python 3.11+；本机验证使用 Python 3.14.6。本版 daemon 单实例锁使用 POSIX `fcntl`，支持 macOS/Linux。
