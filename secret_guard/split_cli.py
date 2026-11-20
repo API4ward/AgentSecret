@@ -86,13 +86,19 @@ def parser():
     s.add_argument("--pairing-file", required=True)
     s = sub.add_parser("secret-add")
     s.add_argument("alias")
-    s.add_argument("--repo", action="append", required=True)
-    for name, text in (("protect-add", "Require approval before the agent's own tools read this"), ("protect-remove", "Stop protecting this")):
-        s = sub.add_parser(name, help=text)
-        group = s.add_mutually_exclusive_group(required=True)
-        group.add_argument("--path", help="A file, directory or file-name pattern: ~/.aws, .env, *.pem")
-        group.add_argument("--text", help="A string that may not appear in a tool call, e.g. an environment variable name")
-    sub.add_parser("protect-list")
+    s.add_argument("--repo", action="append", default=[], help="Repository the GitHub adapter may use this credential for")
+    s.add_argument("--label", default="default", help="Store a further copy under the same alias, e.g. a second API key")
+    s = sub.add_parser("mode", help="all: approve everything for a while; ask: back to asking for each request")
+    s.add_argument("mode", choices=["all", "ask"])
+    s.add_argument("--minutes", type=float, default=10)
+    s = sub.add_parser("auto-add", help="Rule-based automatic approval; every field is a glob")
+    s.add_argument("--kind", default="*", choices=["*", "reference", "use", "reveal", "fill"])
+    s.add_argument("--secret", default="*")
+    s.add_argument("--tool", default="*")
+    s.add_argument("--target", default="*", help="File path, URL or repository the tool call is aimed at")
+    sub.add_parser("auto-list")
+    s = sub.add_parser("auto-remove")
+    s.add_argument("id", type=int)
     sub.add_parser("run", help="Show pending requests and approve or deny each at the keyboard")
     s = sub.add_parser("revoke")
     s.add_argument("kind", choices=["secret", "injector"])
@@ -115,25 +121,47 @@ def read_pairing(path, kind):
     return data
 
 
+def publish(approver):
+    try:
+        approver.publish_matchers()
+        return " Matchers published."
+    except Exception:
+        return " Matchers will be published when this approver next connects."
+
+
 def describe(payload):
-    lines = [f"  项目 {payload['project']} · 任务 {payload['task']} · 凭据 {payload['secret_id']}"]
-    if payload["kind"] == "access":
-        d = payload["details"]
-        lines = [f"  项目 {payload['project']} · 任务 {payload['task']}",
-                 f"  命中保护规则 {'文件' if d['rule']['kind'] == 'path' else '字符串'} {d['rule']['value']}",
-                 f"  工具 {d['tool']} · 调用 {d['summary']!r}", "  批准后，这次调用读到的内容会进入 agent 的上下文"]
-    elif payload["kind"] == "use":
-        d = payload["details"]
-        lines.append(f"  操作 {d['method']} https://{d['host']}{d['path']}?{d['query']}")
+    d = payload["details"]
+    if payload["kind"] in protocol.HOOK_KINDS:
+        what = "工具返回的内容里有密码；批准后以引用代替密码交给 agent" if payload["kind"] == "reveal" else "工具调用里有密码引用；批准后把引用换成密码再执行"
+        lines = [f"  项目 {payload['project']} · 任务 {payload['task']} · 密码 {'、'.join(d['secrets'])}", "  " + what,
+                 f"  工具 {d['tool']}" + (f" · 目标 {d['target']}" if d["target"] else "") + f" · 调用 {d['summary']!r}"]
     else:
-        once = payload["details"]["type"] == "once"
-        lines.append("  操作 允许本任务引用该凭据（" + ("一次性：只能发起一次使用申请" if once else "长期：批准后 1 小时内可反复申请使用") + "）；每次使用仍需单独批准")
+        lines = [f"  项目 {payload['project']} · 任务 {payload['task']} · 凭据 {payload['secret_id']}"]
+        if payload["kind"] == "use":
+            lines.append(f"  操作 {d['method']} https://{d['host']}{d['path']}?{d['query']}")
+        else:
+            once = d["type"] == "once"
+            lines.append("  操作 允许本任务引用该凭据（" + ("一次性：只能发起一次使用申请" if once else "长期：批准后 1 小时内可反复申请使用") + "）；每次使用仍需单独批准")
     lines.append(f"  注入工具 {payload['injector']} · 有效至 {time.strftime('%H:%M:%S', time.localtime(payload['expires_at']))}")
     return "\n".join(lines)
 
 
+TITLES = {"use": "允许这一次具体使用？", "reference": "允许任务引用凭据？", "reveal": "agent 读到的内容里有密码，允许以引用形式交给它？", "fill": "agent 要把密码填进这次调用，允许吗？"}
+AUTO = {"all": "全部同意模式", "grant": "此前选择的多次或限时允许", "rule": "自动审批规则"}
+
+
+def parse_answer(answer):
+    """yes | no | <n>x (allow n times) | <n>m (allow for n minutes) -> (decision, grant)."""
+    answer = answer.strip().lower()
+    if answer in ("yes", "y"):
+        return "approve", None
+    if answer[:-1].isdigit() and int(answer[:-1]) > 0 and answer[-1] in "xm":
+        return "approve", {"times": int(answer[:-1])} if answer[-1] == "x" else {"seconds": int(answer[:-1]) * 60}
+    return "deny", None
+
+
 def approve_loop(approver):
-    approver.publish_rules()
+    approver.publish_matchers()
     print("审批端已连接。Ctrl-C 退出。", flush=True)
     seen = set()
     while True:
@@ -142,14 +170,25 @@ def approve_loop(approver):
                 continue
             seen.add(item["request_id"])
             payload = item["payload"]
-            print("\n" + {"use": "允许这一次具体使用？", "access": "agent 的工具调用要读取受保护内容，允许这一次？"}.get(payload.get("kind"), "允许任务引用凭据？"))
+            print("\n" + TITLES.get(payload.get("kind"), "请求"))
             if item["problem"]:
                 # Rules come before the prompt: a forbidden request is rejected with its reason, never offered.
                 print(f"  {'已自动拒绝并告知调用方' if item['rejected'] else '不能批准'}：{protocol.explain(item['problem'])}")
                 continue
             print(describe(payload))
-            answer = input("  批准输入 yes，其余任意输入为拒绝: ").strip()
-            print("  " + approver.decide(item, "approve" if answer == "yes" else "deny")["state"])
+            if item["auto"]:
+                print(f"  已自动批准（{AUTO[item['auto']]}）")
+                continue
+            decision, grant = parse_answer(input("  yes 允许一次 · 3x 允许 3 次 · 10m 允许 10 分钟 · 其余为拒绝: "))
+            choices = {}
+            if decision == "approve" and payload["kind"] in ("use", "fill"):
+                # The user may return something other than the stored credential.
+                for alias in approver.facets(payload)[1]:
+                    labels = approver.labels(alias)
+                    print(f"  返回给 {alias} 的值：回车=保存的密码" + (f" · copy:<副本名>（{'、'.join(labels[1:])}）" if len(labels) > 1 else "") + " · mock=形状相同的假值 · manual=手动输入")
+                    choice = input("  > ").strip() or "default"
+                    choices[alias] = "manual:" + getpass.getpass("  手动输入（不回显）: ") if choice == "manual" else choice
+            print("  " + approver.decide(item, decision, choices or None, grant)["state"])
         time.sleep(1)
 
 
@@ -225,17 +264,18 @@ def main():
                 approver.pair_injector(d["device"], d["user"], d["jwk"], d["enc_jwk"])
                 print("Injector paired. Credentials are sealed to this injector only.")
             elif args.command == "secret-add":
-                approver.add_secret(args.alias, getpass.getpass("密码（不回显；内容由你管理，按原样保存）: "), args.repo)
-                print("Credential stored on this approver.")
-            elif args.command in ("protect-add", "protect-remove"):
-                rule = approver.set_rule("path" if args.path else "text", args.path or args.text, args.command == "protect-add")
-                try:
-                    approver.publish_rules()
-                    print(json.dumps({"rule": rule, "published": True}, ensure_ascii=False))
-                except Exception:
-                    print(json.dumps({"rule": rule, "published": False, "note": "saved here; it reaches the injector when this approver next connects"}, ensure_ascii=False))
-            elif args.command == "protect-list":
-                print(json.dumps(approver.list_rules(), indent=2, ensure_ascii=False))
+                approver.add_secret(args.alias, getpass.getpass("密码（不回显；内容由你管理，按原样保存）: "), args.repo, args.label)
+                print("Credential stored on this approver." + publish(approver))
+            elif args.command == "mode":
+                approver.approve_all(args.minutes * 60 if args.mode == "all" else 0)
+                print(f"此后 {args.minutes:g} 分钟内，能批准的请求都自动批准（需要 approver run 在运行）。" if args.mode == "all" else "已恢复逐条询问。")
+            elif args.command == "auto-add":
+                print(json.dumps({"id": approver.add_auto_rule(args.kind, args.secret, args.tool, args.target)}))
+            elif args.command == "auto-list":
+                print(json.dumps(approver.auto_rules(), indent=2, ensure_ascii=False))
+            elif args.command == "auto-remove":
+                approver.remove_auto_rule(args.id)
+                print("Removed.")
             elif args.command == "run":
                 approve_loop(approver)
             elif args.command == "revoke":

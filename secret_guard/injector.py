@@ -14,7 +14,7 @@ import sqlite3
 import threading
 import time
 
-from . import adapter, protocol
+from . import adapter, matcher, protocol
 from .broker import Broker, GuardError
 from .crypto import canonical, digest, opaque, verify
 from .link import DeviceLink, http_call
@@ -63,6 +63,7 @@ class Injector:
         self.lock = threading.RLock()
         self.running = threading.Lock()
         self.settle_seconds = 0
+        self.values = {}  # operation id -> {alias: value}, in memory until the hook takes them
         with self.tx() as db:
             db.executescript(SCHEMA)
             for statement in MIGRATIONS:
@@ -195,32 +196,51 @@ class Injector:
             out = self.create_request(db, task, alias, "reference", protocol.reference_details(type))
         return self.settle(token, out)
 
-    # Hook surface: what the agent's own tools may not read, and the approval a read triggers.
-    def current_rules(self, db):
+    # Hook surface. The hook beside the agent sends what a tool returned (scan) or what a tool
+    # is about to receive (fill); the matchers and, briefly, an approved value stay in here.
+    def matcher_sets(self, db):
         rows = db.execute("SELECT r.rules_text FROM rules r JOIN approvers a ON a.id=r.approver WHERE a.active=1").fetchall()
-        seen = {canonical(rule): rule for row in rows for rule in json.loads(row["rules_text"])["rules"]}
-        return [seen[key] for key in sorted(seen)]
+        return [json.loads(row["rules_text"]) for row in rows]
 
-    def rules(self, token):
+    def scan(self, token, texts):
+        """Where credentials sit in each text: [[start, end, alias], ...] in UTF-8 byte offsets."""
+        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+            raise GuardError("arguments_invalid")
         with self.tx() as db:
             self.task(db, token)
-            return {"rules": self.current_rules(db)}
+            sets = self.matcher_sets(db)
+        try:
+            return {"found": [matcher.scan(text.encode(), sets) for text in texts]}
+        except ValueError:
+            raise GuardError("content_too_large") from None
 
-    def access(self, token, tool, rule, summary, call):
-        """The hook saw a tool call that would read protected content: ask the approver, once, for this exact call."""
-        if not (isinstance(tool, str) and 0 < len(tool) <= 128 and isinstance(summary, str) and len(summary) <= 600
-                and isinstance(call, str) and re.fullmatch(r"[0-9a-f]{64}", call) and protocol.valid_rule(rule)):
+    def hook_request(self, token, kind, tool, target, summary, call, secrets):
+        """Ask the approver about one tool call: may this content reach the agent (reveal),
+        may these references become credentials for this call (fill)."""
+        if not (kind in protocol.HOOK_KINDS and isinstance(tool, str) and 0 < len(tool) <= 128
+                and isinstance(target, str) and len(target) <= 300 and isinstance(summary, str) and len(summary) <= 600
+                and isinstance(call, str) and re.fullmatch(r"[0-9a-f]{64}", call) and isinstance(secrets, list)
+                and 0 < len(secrets) <= 20 and all(isinstance(a, str) and ALIAS.fullmatch(a) for a in secrets)):
             raise GuardError("arguments_invalid")
         with self.tx() as db:
             task = self.task(db, token)
-            if rule not in self.current_rules(db):
-                raise GuardError("arguments_invalid")
-            out = self.create_request(db, task, "", "access", protocol.access_details(tool, rule, summary, call))
+            out = self.create_request(db, task, "", kind, protocol.hook_details(kind, tool, target, summary, call, sorted(set(secrets))))
         return self.settle(token, out)
 
+    def take(self, token, operation_id):
+        """Hand an approved fill's values to the hook, once. They were never written to disk."""
+        with self.tx() as db:
+            task = self.task(db, token)
+            done = db.execute("UPDATE requests SET state='used' WHERE id=? AND task=? AND kind='fill' AND state='approved'", (operation_id, task["id"])).rowcount
+            values = self.values.pop(operation_id, None)
+            if not done or values is None:
+                raise GuardError("operation_unavailable")
+            self.audit(db, "filled", operation_id, task["id"])
+        return {"values": values}
+
     def sync_rules(self):
-        """Fetch the approvers' rules from the relay. Only a paired approver's signature counts,
-        and a version never goes backwards, so the relay can neither invent nor roll back rules."""
+        """Fetch the approvers' compiled matchers from the relay. Only a paired approver's signature
+        counts, and a version never goes backwards, so the relay can neither invent nor roll back a set."""
         try:
             entries = self.link.request("/injector/rules", {})["rules"]
         except Exception:
@@ -233,7 +253,7 @@ class Injector:
                     payload = json.loads(entry["rules_text"])
                     old = db.execute("SELECT version FROM rules WHERE approver=?", (paired["id"],)).fetchone()
                     if payload["approver"] != paired["id"] or type(payload["version"]) is not int or (old and payload["version"] <= old[0]) \
-                            or not all(protocol.valid_rule(rule) for rule in payload["rules"]):
+                            or not matcher.valid_set(payload):
                         continue
                     db.execute("INSERT OR REPLACE INTO rules VALUES(?,?,?)", (paired["id"], payload["version"], entry["rules_text"]))
                     self.audit(db, "rules_updated")
@@ -349,9 +369,9 @@ class Injector:
                     self.audit(db, final, row["id"], row["task"])
 
     def grant(self, request_id, answer):
-        """An approved reference becomes a ref; an approved read lets the hook pass that one tool call."""
+        """An approved reference becomes a ref; an approved reveal or fill lets the hook finish that one tool call."""
         with self.tx() as db:
-            row = db.execute("SELECT * FROM requests WHERE id=? AND kind IN ('reference','access') AND state='pending'", (request_id,)).fetchone()
+            row = db.execute("SELECT * FROM requests WHERE id=? AND kind IN ('reference','reveal','fill') AND state='pending'", (request_id,)).fetchone()
             if not row:
                 return False
             task = db.execute("SELECT * FROM tasks WHERE id=? AND active=1 AND expires>?", (row["task"], self.clock())).fetchone()
@@ -366,9 +386,21 @@ class Injector:
                 db.execute("UPDATE requests SET state='revoked',reason=? WHERE id=?", ("approver_not_paired" if str(exc) == "device_unauthorized" else None, request_id))
                 self.audit(db, "approval_rejected", request_id, row["task"])
                 return False
-            if row["kind"] == "access":
+            if row["kind"] == "fill":
+                try:
+                    # Opens only if sealed to this injector for exactly this request.
+                    values = json.loads(unseal(self.sealing, answer["sealed"], protocol.seal_aad(row["request_text"])))
+                    wanted = json.loads(row["request_text"])["details"]["secrets"]
+                    if sorted(values) != wanted or not all(isinstance(v, str) for v in values.values()):
+                        raise ValueError
+                except Exception:
+                    db.execute("UPDATE requests SET state='revoked' WHERE id=?", (request_id,))
+                    self.audit(db, "execution_blocked", request_id, row["task"])
+                    return False
+                self.values[request_id] = values
+            if row["kind"] in protocol.HOOK_KINDS:
                 db.execute("UPDATE requests SET state='approved' WHERE id=?", (request_id,))
-                self.audit(db, "read_approved", request_id, task["id"])
+                self.audit(db, row["kind"] + "_approved", request_id, task["id"])
                 return True
             ref = opaque("secretref://r_")
             # The expiry is fixed here, when the approval arrives, and reported in status.

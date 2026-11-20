@@ -64,15 +64,16 @@ def claude_mcp_config(token_file, url="http://127.0.0.1:8765"):
 
 def claude_settings(protect, guard=None):
     # Guardrail, not a boundary: the hook runs as the agent's own OS user.
-    # guard = (injector URL, token file): the hook also asks the injector for the rules set on
-    # the approver and waits for the user's decision when a tool call would read protected content.
+    # guard = (injector URL, token file): the hook also has the injector scan tool results for the
+    # user's credentials and fill credential references into tool inputs, each after an approval.
     protect = [str(Path(p).expanduser().resolve()) for p in protect]
     hook = [sys.executable, "-I", str(Path(__file__).resolve().with_name("claude_hook.py"))]
     command = shlex.join(hook + [x for p in protect for x in ("--protect", p)]
                          + (["--guard-url", guard[0], "--token-file", str(Path(guard[1]).resolve())] if guard else []))
     deny = [f"{tool}(/{p}{suffix})" for p in protect for tool in ("Read", "Edit") for suffix in ("", "/**")]
     return {"permissions": {"deny": deny},
-            "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 130 if guard else 10}]}]}}
+            "hooks": {event: [{"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 130 if guard else 10, "onFailure": "block"}]}]
+                      for event in (("PreToolUse", "PostToolUse") if guard else ("PreToolUse",))}}
 
 
 def toml(value):
@@ -92,7 +93,7 @@ def codex_overrides(token_file, protect, url="http://127.0.0.1:8765", guard=None
             "permissions.secret_guard.extends": ":workspace",
             "permissions.secret_guard.filesystem": {str(Path(p).expanduser().resolve()): "none" for p in protect},
             "default_permissions": "secret_guard",
-            "hooks.PreToolUse": claude_settings(protect, guard)["hooks"]["PreToolUse"]}
+            **{"hooks." + event: value for event, value in claude_settings(protect, guard)["hooks"].items()}}
 
 
 def exclusive_json(path, value):

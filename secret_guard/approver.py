@@ -15,7 +15,9 @@ import time
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import adapter, protocol
+import fnmatch
+
+from . import adapter, matcher, protocol
 from .broker import GuardError
 from .crypto import canonical, verify
 from .injector import ALIAS, load_config
@@ -26,7 +28,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS secrets(alias TEXT PRIMARY KEY, version INTEGER, ciphertext BLOB, policy TEXT, active INTEGER);
 CREATE TABLE IF NOT EXISTS injectors(id TEXT PRIMARY KEY, jwk TEXT, enc_jwk TEXT, active INTEGER);
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, event TEXT, request_id TEXT);
-CREATE TABLE IF NOT EXISTS rules(kind TEXT, value TEXT, PRIMARY KEY(kind, value));
+CREATE TABLE IF NOT EXISTS copies(alias TEXT, label TEXT, ciphertext BLOB, PRIMARY KEY(alias, label));
+CREATE TABLE IF NOT EXISTS grants(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, secrets TEXT, project TEXT, remaining INTEGER, expires REAL, choices BLOB);
+CREATE TABLE IF NOT EXISTS auto_rules(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, secret TEXT, tool TEXT, target TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER);
 """
 
@@ -84,7 +88,11 @@ class Approver:
             db.execute("INSERT INTO injectors VALUES(?,?,?,1)", (device, canonical(public), canonical(enc_public)))
             self.audit(db, "injector_paired")
 
-    def add_secret(self, alias, value, repos):
+    def add_secret(self, alias, value, repos=(), label="default"):
+        """Store a credential. Further copies under the same alias (say, several API keys of one
+        service) take a label; the approval panel can hand out any of them."""
+        if label != "default":
+            return self.add_copy(alias, label, value)
         # The credential is the user's to manage: stored exactly as given, never inspected.
         # The alias is what tells credentials apart, so only the alias has a format.
         if not isinstance(alias, str) or not ALIAS.fullmatch(alias):
@@ -97,8 +105,6 @@ class Approver:
             normalized = sorted({adapter.normalize(repo, 1)["repo"] for repo in repos})
         except Exception:
             raise GuardError("repo_invalid") from None
-        if not normalized:
-            raise GuardError("empty_policy")
         with self.tx() as db:
             row = db.execute("SELECT version FROM secrets WHERE alias=?", (alias,)).fetchone()
             version = row[0] + 1 if row else 1
@@ -107,32 +113,101 @@ class Approver:
             db.execute("INSERT OR REPLACE INTO secrets VALUES(?,?,?,?,1)", (alias, version, ciphertext, canonical({"repos": normalized})))
             self.audit(db, "secret_updated")
 
-    # Protection rules: what the agent's own tools may not read without an approval from here.
-    def list_rules(self):
+    def add_copy(self, alias, label, value):
+        if not isinstance(label, str) or not ALIAS.fullmatch(label):
+            raise GuardError("alias_invalid")
+        if not isinstance(value, str) or not value:
+            raise GuardError("secret_empty")
+        if len(value.encode()) > MAX_PLAINTEXT // 4:
+            raise GuardError("secret_too_large")
         with self.tx() as db:
-            return [{"kind": r["kind"], "value": r["value"]} for r in db.execute("SELECT * FROM rules ORDER BY kind, value")]
+            if not db.execute("SELECT 1 FROM secrets WHERE alias=? AND active=1", (alias,)).fetchone():
+                raise GuardError("secret_unavailable")
+            nonce = secrets.token_bytes(12)
+            blob = nonce + self.vault.encrypt(nonce, value.encode(), canonical([alias, "copy", label]).encode())
+            db.execute("INSERT OR REPLACE INTO copies VALUES(?,?,?)", (alias, label, blob))
+            self.audit(db, "copy_updated")
 
-    def set_rule(self, kind, value, present=True):
-        rule = {"kind": kind, "value": value.strip() if isinstance(value, str) else value}
-        if not protocol.valid_rule(rule):
-            raise GuardError("rule_invalid")
-        with self.tx() as db:
-            if present:
-                db.execute("INSERT OR IGNORE INTO rules VALUES(?,?)", (rule["kind"], rule["value"]))
-            elif not db.execute("DELETE FROM rules WHERE kind=? AND value=?", (rule["kind"], rule["value"])).rowcount:
-                raise GuardError("rule_unknown")
-            self.audit(db, "rule_added" if present else "rule_removed")
-        return rule
+    def values(self, db, alias):
+        """Every stored copy of one credential: {"default": ..., label: ...}. Plaintext; stays on this device."""
+        row = db.execute("SELECT * FROM secrets WHERE alias=? AND active=1", (alias,)).fetchone()
+        if not row:
+            return {}
+        blob = row["ciphertext"]
+        out = {"default": self.vault.decrypt(blob[:12], blob[12:], canonical([row["alias"], row["version"]]).encode()).decode()}
+        for copy in db.execute("SELECT * FROM copies WHERE alias=? ORDER BY label", (alias,)):
+            blob = copy["ciphertext"]
+            out[copy["label"]] = self.vault.decrypt(blob[:12], blob[12:], canonical([alias, "copy", copy["label"]]).encode()).decode()
+        return out
 
-    def publish_rules(self):
-        """Sign the whole rule set and hand it to the relay for this user's injectors."""
+    def labels(self, alias):
         with self.tx() as db:
-            rules = [{"kind": r["kind"], "value": r["value"]} for r in db.execute("SELECT * FROM rules ORDER BY kind, value")]
+            return list(self.values(db, alias))
+
+    def publish_matchers(self):
+        """Compile every stored credential into a matcher, sign the set, and hand it to the relay
+        for this user's injectors. The plaintext stays here; see matcher.py for what a matcher gives away."""
+        with self.tx() as db:
+            base = matcher.new_base()
+            compiled = [matcher.compile_one(row["alias"], value, base)
+                        for row in db.execute("SELECT alias FROM secrets WHERE active=1 ORDER BY alias").fetchall()
+                        for value in self.values(db, row["alias"]).values()]
             last = db.execute("SELECT value FROM meta WHERE key='rules_version'").fetchone()
             version = max(int(self.clock() * 1000), (last[0] if last else 0) + 1)
             db.execute("INSERT OR REPLACE INTO meta VALUES('rules_version',?)", (version,))
-        text = canonical({"approver": self.device, "version": version, "rules": rules})
+        text = canonical({"approver": self.device, "version": version, "base": str(base), "matchers": [m for m in compiled if m]})
         return self.link.request("/approver/rules", {"rules_text": text, "signature": sign(self.signing, protocol.rules_message(text))})
+
+    # Approval modes. All of them are this device answering for the user; every answer is
+    # still an individually signed decision, so the relay and the injector see nothing new.
+    def approve_all(self, seconds):
+        """Approve everything approvable for a while (0 turns it off)."""
+        with self.tx() as db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES('approve_all_until',?)", (int(self.clock() + seconds) if seconds > 0 else 0,))
+            self.audit(db, "approve_all_on" if seconds > 0 else "approve_all_off")
+
+    def add_auto_rule(self, kind="*", secret="*", tool="*", target="*"):
+        """Rule-based automatic approval: request kind, credential alias, tool and target, each a glob."""
+        if kind not in ("*", "reference", "use", *protocol.HOOK_KINDS) or not all(isinstance(v, str) and 0 < len(v) <= 256 for v in (secret, tool, target)):
+            raise GuardError("rule_invalid")
+        with self.tx() as db:
+            self.audit(db, "auto_rule_added")
+            return db.execute("INSERT INTO auto_rules(kind,secret,tool,target) VALUES(?,?,?,?)", (kind, secret, tool, target)).lastrowid
+
+    def remove_auto_rule(self, identity):
+        with self.tx() as db:
+            if not db.execute("DELETE FROM auto_rules WHERE id=?", (identity,)).rowcount:
+                raise GuardError("rule_invalid")
+
+    def auto_rules(self):
+        with self.tx() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM auto_rules ORDER BY id")]
+
+    @staticmethod
+    def facets(payload):
+        """What a mode or rule looks at: kind, credentials, tool, target."""
+        d = payload["details"]
+        if payload["kind"] in protocol.HOOK_KINDS:
+            return payload["kind"], d["secrets"], d["tool"], d["target"]
+        return payload["kind"], [payload["secret_id"]], "github" if payload["kind"] == "use" else "", d.get("args", {}).get("repo", "")
+
+    def automatic(self, db, payload):
+        """Whether a mode answers this request without the user: (why, choices) or None."""
+        kind, names, tool, target = self.facets(payload)
+        until = db.execute("SELECT value FROM meta WHERE key='approve_all_until'").fetchone()
+        if until and until[0] > self.clock():
+            return "all", None
+        for g in db.execute("SELECT * FROM grants WHERE kind=? AND secrets=? AND project=?", (kind, canonical(names), payload["project"])).fetchall():
+            if (g["expires"] is None or g["expires"] > self.clock()) and (g["remaining"] is None or g["remaining"] > 0):
+                if g["remaining"] is not None:
+                    db.execute("UPDATE grants SET remaining=remaining-1 WHERE id=?", (g["id"],))
+                blob = g["choices"]
+                return "grant", json.loads(self.vault.decrypt(blob[:12], blob[12:], b"grant")) if blob else None
+        for r in db.execute("SELECT * FROM auto_rules").fetchall():
+            if r["kind"] in ("*", kind) and all(fnmatch.fnmatchcase(n, r["secret"]) for n in names) \
+                    and fnmatch.fnmatchcase(tool, r["tool"]) and fnmatch.fnmatchcase(target, r["target"]):
+                return "rule", None
+        return None
 
     def revoke(self, kind, identity):
         with self.tx() as db:
@@ -163,17 +238,18 @@ class Approver:
             return payload, injector, "request_invalid"
         if payload["expires_at"] <= self.clock():
             return payload, injector, "expired"
-        if payload.get("kind") == "access":
-            # A read of protected content carries no credential; the rule it names must be one of ours.
+        if payload.get("kind") in protocol.HOOK_KINDS:
+            # The hook's requests name credentials by alias; every one must be stored here.
             d = payload.get("details")
             try:
-                if d != protocol.access_details(d["tool"], d["rule"], d["summary"], d["call"]) or not protocol.valid_rule(d["rule"]) \
-                        or not all(isinstance(d[k], str) for k in ("tool", "summary", "call")):
+                if d != protocol.hook_details(payload["kind"], d["tool"], d["target"], d["summary"], d["call"], d["secrets"]) \
+                        or not all(isinstance(d[k], str) for k in ("tool", "target", "summary", "call")) \
+                        or not d["secrets"] or not all(isinstance(a, str) for a in d["secrets"]):
                     return payload, injector, "request_invalid"
             except Exception:
                 return payload, injector, "request_invalid"
-            known = db.execute("SELECT 1 FROM rules WHERE kind=? AND value=?", (d["rule"]["kind"], d["rule"]["value"])).fetchone()
-            return payload, injector, None if known else "rule_unknown"
+            known = all(db.execute("SELECT 1 FROM secrets WHERE alias=? AND active=1", (a,)).fetchone() for a in d["secrets"])
+            return payload, injector, None if known else "secret_unavailable"
         secret = db.execute("SELECT * FROM secrets WHERE alias=? AND active=1", (payload.get("secret_id"),)).fetchone()
         if not secret:
             return payload, injector, "secret_unavailable"
@@ -191,9 +267,10 @@ class Approver:
             return payload, injector, "request_invalid"
         return payload, injector, None
 
-    def pending(self, reject=True):
-        """Requests waiting for this user. One this device can never approve is rejected at
-        once with its reason, so the caller is told why instead of waiting for a person."""
+    def pending(self, reject=True, automate=True):
+        """Requests waiting for this user. One this device can never approve is rejected at once
+        with its reason; one a mode covers (approve-all, a standing grant, an automatic rule) is
+        approved at once; the rest are for the user."""
         entries = self.link.request("/approver/pending", {})["requests"]
         out = []
         with self.tx() as db:
@@ -202,17 +279,41 @@ class Approver:
                     payload, _, problem = self.check(db, entry)
                 except Exception:
                     continue  # Not even parseable: never shown, never signed.
-                out.append({"request_id": payload["request_id"], "payload": payload, "problem": problem, "entry": entry, "rejected": False})
+                out.append({"request_id": payload["request_id"], "payload": payload, "problem": problem, "entry": entry, "rejected": False, "auto": None})
         for item in out:
-            if reject and item["problem"] in protocol.REASONS:
-                try:
+            try:
+                if reject and item["problem"] in protocol.REASONS:
                     self.decide(item, "deny")
                     item["rejected"] = True
-                except GuardError:
-                    pass
+                elif automate and not item["problem"]:
+                    with self.tx() as db:
+                        auto = self.automatic(db, item["payload"])
+                    if auto:
+                        self.decide(item, "approve", choices=auto[1])
+                        item["auto"] = auto[0]
+            except GuardError:
+                pass
         return out
 
-    def decide(self, item, decision):
+    def resolve(self, db, alias, choice):
+        """The value an approval returns for one credential: the stored one, another copy with the
+        same alias, a mock of the same shape, or whatever the user typed."""
+        stored = self.values(db, alias)
+        if choice in (None, "default"):
+            return stored["default"]
+        if choice == "mock":
+            return matcher.mock(stored["default"])
+        if isinstance(choice, str) and choice.startswith("copy:"):
+            if choice[5:] not in stored:
+                raise GuardError("copy_unknown")
+            return stored[choice[5:]]
+        if isinstance(choice, str) and choice.startswith("manual:") and len(choice) > 7:
+            return choice[7:]
+        raise GuardError("choice_invalid")
+
+    def decide(self, item, decision, choices=None, grant=None):
+        """choices: {alias: "default" | "copy:<label>" | "mock" | "manual:<text>"} for what is returned.
+        grant: {"times": n} or {"seconds": s} to answer the same kind of request again without asking."""
         if decision not in {"approve", "deny"}:
             raise GuardError("decision_invalid")
         text = item["entry"]["request_text"]
@@ -222,13 +323,21 @@ class Approver:
             if decision == "approve":
                 if problem:
                     raise GuardError(problem)
-                if payload["kind"] == "use":
-                    row = db.execute("SELECT * FROM secrets WHERE alias=? AND active=1", (payload["secret_id"],)).fetchone()
-                    blob = row["ciphertext"]
-                    value = self.vault.decrypt(blob[:12], blob[12:], canonical([row["alias"], row["version"]]).encode())
+                kind, names, _, _ = self.facets(payload)
+                if kind in ("use", "fill"):
+                    picked = {alias: self.resolve(db, alias, (choices or {}).get(alias)) for alias in names}
+                    value = picked[names[0]].encode() if kind == "use" else canonical(picked).encode()
                     # Sealed to the key recorded at pairing, never to a key the relay supplies.
                     body["sealed"] = seal(json.loads(injector["enc_jwk"]), value, protocol.seal_aad(text))
-                    value = None
+                    value = picked = None
+                if grant:
+                    times, seconds = grant.get("times"), grant.get("seconds")
+                    if (times is None) == (seconds is None) or (times is not None and not 1 <= times <= 1000) or (seconds is not None and not 0 < seconds <= 86400):
+                        raise GuardError("decision_invalid")
+                    nonce = secrets.token_bytes(12)
+                    blob = nonce + self.vault.encrypt(nonce, canonical(choices).encode(), b"grant") if choices else None
+                    db.execute("INSERT INTO grants(kind,secrets,project,remaining,expires,choices) VALUES(?,?,?,?,?,?)",
+                               (kind, canonical(names), payload["project"], times - 1 if times else None, self.clock() + seconds if seconds else None, blob))
             reason = problem if decision == "deny" and problem in protocol.REASONS else ""
             if reason:
                 body["reason"] = reason
