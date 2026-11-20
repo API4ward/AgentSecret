@@ -13,7 +13,7 @@ import sys
 
 ALLOWED_PREFIX = "mcp__secret_guard__"
 # The trusted CLI and package can open the vault; an agent has no reason to run them.
-TRUSTED_NAMES = ("secret-guard", "secret_guard", "guardctl")
+TRUSTED_NAMES = ("secret-guard", "secret_guard", "agentsecret")
 MESSAGE = ("Secret Guard: blocked ({}). Broker state, credentials and task tokens are off limits to agent tools; "
            "use the mcp__secret_guard__* tools instead. Do not retry with a different spelling.")
 VARIABLE = re.compile(r"\$(\w+)|\$\{(\w+)\}")

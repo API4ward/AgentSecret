@@ -118,7 +118,7 @@ class ClaudeHookTests(unittest.TestCase):
             ".venv/bin/secret-guard secret-add x --repo a/b --user u --project p",
             "python -m secret_guard.cli revoke task task_1",
             "python -c 'from secret_guard.broker import Broker'",
-            "isolation/guardctl broker activity",
+            "agentsecret approver activity",
             "cat run-01.token",
         ]:
             with self.subTest(command=command):
@@ -143,7 +143,7 @@ class ClaudeHookTests(unittest.TestCase):
                 self.allowed("Bash", command=command)
 
     def test_known_bypass_is_documented_not_blocked(self):
-        # A path assembled at run time never appears in the command text. Only OS isolation stops this.
+        # A path assembled at run time never appears in the command text. Out of scope: no sandbox is provided.
         parts = "+".join(f"chr({ord(c)})" for c in str(self.token))
         self.allowed("Bash", command=f"python3 -c 'print(open({parts}).read())'")
 

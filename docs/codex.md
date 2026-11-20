@@ -41,7 +41,7 @@ MCP bridge 由 Codex 自身在沙箱外启动，所以仍能读到 token 文件�
 - 沙箱只约束模型发起的命令。加了 `-s danger-full-access` 或 `--dangerously-bypass-approvals-and-sandbox` 就没有这层保护。交互模式下模型可以申请让某条命令脱离沙箱，批准与否由用户决定，不要批准读取受保护路径的命令。
 - 读取禁令的实测只在 macOS 上做过。Linux 上 Codex 用 Landlock 和 seccomp，未验证。
 - 其他 MCP 服务器、Codex 的 hosted 工具不经过沙箱。
-- 沙箱和 hook 都在 agent 所在的 OS 账户内配置。要防有意绕过整个 Codex 的进程，使用[隔离部署](isolation.md)。
+- 沙箱和 hook 都在 agent 所在的 OS 账户内配置。有意绕过整个 Codex 的进程不在防护范围内，本产品不提供沙盒。
 
 ## 第 2 层：通过 MCP 使用密码
 

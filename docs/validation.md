@@ -35,7 +35,7 @@
 
 结果摘要见 [reviews/2026-11-11-claude-code-e2e](reviews/2026-11-11-claude-code-e2e/)，分析见 [claude-code.md](claude-code.md)。人在审批页面上批准、恢复/分叉/后台 agent、hooks、真实 GitHub 均 **NOT_RUN**。运行未修改全局 Claude Code 配置；它加载了本机用户已有的 Claude Code 设置和登录。
 
-## 2026-11-11 OS 隔离验收
+## 2026-11-11 OS 隔离验收（该部署方式已于 2026-11-20 移除，以下为历史记录）
 
 环境：macOS 26.3、Docker 29.2.0（Docker Desktop，arm64）、宿主 Python 3.14.6、镜像 python:3.12-slim。
 

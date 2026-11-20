@@ -1,6 +1,0 @@
-.git
-.venv
-build
-*.egg-info
-**/__pycache__
-*.token

@@ -1,10 +1,7 @@
 """Separate agent and approval listeners. Administration stays on trusted CLI."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import os
 from pathlib import Path
-import socket
-import socketserver
 import ssl
 import threading
 from urllib.parse import urlsplit
@@ -102,39 +99,10 @@ def handler(broker, role):
     return Handler
 
 
-UNIX_HOST = "secret-guard-agent"  # Fixed Host for the socket listener; no DNS involved.
-
-
-class UnixHTTPServer(ThreadingHTTPServer):
-    address_family = socket.AF_UNIX
-
-    def server_bind(self):
-        # Group access only: the worker domain reaches the broker through the
-        # socket's group, never through a TCP port shared with the approval side.
-        Path(self.server_address).unlink(missing_ok=True)
-        old = os.umask(0o117)
-        try:
-            socketserver.TCPServer.server_bind(self)
-        finally:
-            os.umask(old)
-        self.server_name, self.server_port = UNIX_HOST, 0
-
-
-def make_unix_server(broker, path):
-    # Agent role only. Approval never listens on a path a worker can mount.
-    server = UnixHTTPServer(str(path), handler(broker, "agent"))
-    server.expected_host = UNIX_HOST
-    return server
-
-
-def make_server(broker, role, host, port, cert=None, key=None, bind=None):
+def make_server(broker, role, host, port, cert=None, key=None):
     if host not in {"127.0.0.1", "localhost"} and not (cert and key):
         raise GuardError("remote_listener_requires_tls")
-    # bind differs from host only inside a broker container whose port is
-    # published to the trusted host's loopback; Host/Origin stay pinned to host.
-    if bind and role != "approval":
-        raise GuardError("container_bind_is_approval_only")
-    server = ThreadingHTTPServer((bind or host, port), handler(broker, role))
+    server = ThreadingHTTPServer((host, port), handler(broker, role))
     server.expected_host = f"{host}:{server.server_port}"
     if cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -144,7 +112,7 @@ def make_server(broker, role, host, port, cert=None, key=None, bind=None):
     return server
 
 
-def serve(broker, host="127.0.0.1", agent_port=8765, approval_port=8766, cert=None, key=None, agent_socket=None, approval_bind=None):
+def serve(broker, host="127.0.0.1", agent_port=8765, approval_port=8766, cert=None, key=None):
     # Multiple broker daemons must not recover a live daemon's executing requests.
     import fcntl
     lock = (broker.state / "server.lock").open("a")
@@ -152,8 +120,8 @@ def serve(broker, host="127.0.0.1", agent_port=8765, approval_port=8766, cert=No
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         raise GuardError("broker_already_running") from None
-    agent = make_unix_server(broker, agent_socket) if agent_socket else make_server(broker, "agent", host, agent_port, cert, key)
-    approval = make_server(broker, "approval", host, approval_port, cert, key, approval_bind)
+    agent = make_server(broker, "agent", host, agent_port, cert, key)
+    approval = make_server(broker, "approval", host, approval_port, cert, key)
     broker.recover()
     stop = threading.Event()
     def executor():
@@ -164,7 +132,7 @@ def serve(broker, host="127.0.0.1", agent_port=8765, approval_port=8766, cert=No
                 pass  # Fail closed; no values or exception messages logged.
     threading.Thread(target=executor, daemon=True).start()
     threading.Thread(target=agent.serve_forever, daemon=True).start()
-    print(f"Agent: unix://{agent_socket}" if agent_socket else f"Agent: {'https' if cert else 'http'}://{host}:{agent_port}")
+    print(f"Agent: {'https' if cert else 'http'}://{host}:{agent_port}")
     print(f"Approval: {'https' if cert else 'http'}://{host}:{approval_port}", flush=True)
     try:
         approval.serve_forever()

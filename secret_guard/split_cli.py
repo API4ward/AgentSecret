@@ -57,7 +57,6 @@ def parser():
     s = sub.add_parser("serve")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--agent-port", type=int, default=8765)
-    s.add_argument("--agent-socket")
     s = sub.add_parser("revoke")
     s.add_argument("kind", choices=["task", "approver", "operation"])
     s.add_argument("identity")
@@ -177,7 +176,7 @@ def main():
                 print(json.dumps({"task_id": task["task_id"], "token_file": str(Path(args.token_file).resolve())}))
             elif args.command == "serve":
                 from .split_server import serve_injector
-                serve_injector(injector, args.host, args.agent_port, args.agent_socket)
+                serve_injector(injector, args.host, args.agent_port)
             elif args.command == "revoke":
                 injector.revoke(args.kind, args.identity)
                 print("Revoked. Already-started external operations require reconciliation.")

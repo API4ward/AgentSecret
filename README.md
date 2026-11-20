@@ -53,7 +53,7 @@ agent API 在 `http://127.0.0.1:8765`，审批页面在 `http://127.0.0.1:8766`�
 
 ## 两层保护
 
-1. **第 1 层：阻止 agent 读取本地密码。** agent 自带的文件和 shell 工具不能打开 broker 状态目录、vault 密钥、task token。Claude Code 用 PreToolUse hook 实现，Codex 用它的 OS 沙箱读取禁令加同一个 hook 实现；需要更强保证时用可选的[隔离部署](docs/isolation.md)。
+1. **第 1 层：阻止 agent 读取本地密码。** agent 自带的文件和 shell 工具不能打开 broker 状态目录、vault 密钥、task token。Claude Code 用 PreToolUse hook 实现，Codex 用它的 OS 沙箱读取禁令加同一个 hook 实现。本产品不提供沙盒或 OS 隔离：hook 是底层防线，拦的是经过 agent 工具调用的读取。
 2. **第 2 层：通过 MCP 服务让 agent 使用密码。** agent 只拿到任务 token 和不透明引用，broker 在审批通过后代为发出请求并注入真实凭据，明文不进入 agent。
 
 `claude-config --settings-out` 和 `codex-config` 一次生成两层所需的配置。
@@ -118,18 +118,6 @@ claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config \
 
 不要用 `claude mcp add` 或仓库 `.mcp.json` 做全局登记。Claude Code 中工具名为 `mcp__secret_guard__guard_request_reference` 等。`--settings-out` 生成的设置文件带有 PreToolUse hook，阻止 Claude 用 Read、Grep、Bash 等自带工具读取 broker 状态目录、token 文件和可信 CLI；MCP 只是调用通道，防读取靠这个 hook。token 和状态目录要放在工作区之外。hook 是同账户下的字符串检查，挡不住运行时拼出的路径，这条保证需要隔离部署。子 agent 与父会话共用同一个 task 身份。已用 Claude Code 2.1.311 和假凭据跑通闭环，详见 [Claude Code 接入与保证范围](docs/claude-code.md)。
 
-## 可选：隔离部署（broker 与 agent 分属不同容器）
-
-隔离部署是可选模式，不需要 Docker 也能按上面的本机流程使用全部功能，默认行为没有变化。区别在于保证范围：本机流程中 broker 和 agent 同属一个用户，agent 可以直接读 vault。需要这条边界时，改用 `isolation/` 下的容器部署：broker 独占状态卷，每个任务的 agent 运行在无网络、非 root、只读根文件系统的 worker 容器里，只能通过一个 Unix socket 调用 agent API。
-
-```sh
-isolation/guardctl up
-isolation/guardctl broker secret-add github-ci --user alice --project payments --repo acme/payments
-isolation/guardctl run --user alice --project payments --workspace /absolute/path/project -- <agent 命令>
-```
-
-worker 内的 MCP 命令为 `python -m secret_guard.cli mcp --url "$SECRET_GUARD_URL" --token-file "$SECRET_GUARD_TOKEN_FILE"`。结构、出网白名单、绕过测试结果和不在保证范围内的事项见 [OS 隔离部署](docs/isolation.md)。
-
 ## 撤销与审计
 
 ```sh
@@ -146,4 +134,4 @@ worker 内的 MCP 命令为 `python -m secret_guard.cli mcp --url "$SECRET_GUARD
 
 已实现受支持 broker 路径中的凭据代理与精确操作授权；结果整体缓冲、校验后才返回。对登记值和常见 base64/hex/URL 编码进行泄漏检查，再通过极小结果 schema；这不构成任意编码检测保证。
 
-**尚未实现严格版**：清洗工作区、输入/附件/原生工具输出过滤、Codex 内核及持久化/压缩/fork 适配。worker/broker OS 隔离与受控出网仅在[隔离部署](docs/isolation.md)下成立；不使用隔离部署时，相同用户权限的 agent 仍可能读取 broker 文件或审批浏览器状态，不能声称“所有消息永不泄漏”或抵御已控制宿主/审批设备的攻击者。请以假凭据验证此原型；真实部署必须先建立设计文档规定的安全域。详见 [实现状态](docs/implementation.md)。
+**尚未实现严格版**：清洗工作区、输入/附件/原生工具输出过滤、Codex 内核及持久化/压缩/fork 适配。本产品不提供 worker/broker OS 隔离或受控出网（隔离部署已于 2026-11-20 移除）；相同用户权限的 agent 仍可能读取 broker 文件或审批浏览器状态，不能声称“所有消息永不泄漏”或抵御已控制宿主/审批设备的攻击者。请以假凭据验证此原型；真实部署必须先建立设计文档规定的安全域。详见 [实现状态](docs/implementation.md)。
