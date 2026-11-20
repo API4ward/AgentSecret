@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS approvers(id TEXT PRIMARY KEY, jwk TEXT, active INTEG
 CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, task TEXT, alias TEXT, kind TEXT, request_text TEXT, state TEXT, ref TEXT, result TEXT);
 CREATE TABLE IF NOT EXISTS refs(id TEXT PRIMARY KEY, task TEXT, alias TEXT, approver TEXT, expires REAL, active INTEGER);
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, event TEXT, request_id TEXT, task TEXT);
+CREATE TABLE IF NOT EXISTS rules(approver TEXT PRIMARY KEY, version INTEGER, rules_text TEXT);
 """
 MIGRATIONS = ["ALTER TABLE requests ADD COLUMN reason TEXT", "ALTER TABLE refs ADD COLUMN type TEXT", "ALTER TABLE refs ADD COLUMN used INTEGER DEFAULT 0"]
 ALIAS = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -194,6 +195,52 @@ class Injector:
             out = self.create_request(db, task, alias, "reference", protocol.reference_details(type))
         return self.settle(token, out)
 
+    # Hook surface: what the agent's own tools may not read, and the approval a read triggers.
+    def current_rules(self, db):
+        rows = db.execute("SELECT r.rules_text FROM rules r JOIN approvers a ON a.id=r.approver WHERE a.active=1").fetchall()
+        seen = {canonical(rule): rule for row in rows for rule in json.loads(row["rules_text"])["rules"]}
+        return [seen[key] for key in sorted(seen)]
+
+    def rules(self, token):
+        with self.tx() as db:
+            self.task(db, token)
+            return {"rules": self.current_rules(db)}
+
+    def access(self, token, tool, rule, summary, call):
+        """The hook saw a tool call that would read protected content: ask the approver, once, for this exact call."""
+        if not (isinstance(tool, str) and 0 < len(tool) <= 128 and isinstance(summary, str) and len(summary) <= 600
+                and isinstance(call, str) and re.fullmatch(r"[0-9a-f]{64}", call) and protocol.valid_rule(rule)):
+            raise GuardError("arguments_invalid")
+        with self.tx() as db:
+            task = self.task(db, token)
+            if rule not in self.current_rules(db):
+                raise GuardError("arguments_invalid")
+            out = self.create_request(db, task, "", "access", protocol.access_details(tool, rule, summary, call))
+        return self.settle(token, out)
+
+    def sync_rules(self):
+        """Fetch the approvers' rules from the relay. Only a paired approver's signature counts,
+        and a version never goes backwards, so the relay can neither invent nor roll back rules."""
+        try:
+            entries = self.link.request("/injector/rules", {})["rules"]
+        except Exception:
+            return False
+        with self.tx() as db:
+            for entry in entries:
+                try:
+                    paired = db.execute("SELECT * FROM approvers WHERE id=? AND active=1", (entry["approver"],)).fetchone()
+                    verify(json.loads(paired["jwk"]), protocol.rules_message(entry["rules_text"]), entry["signature"])
+                    payload = json.loads(entry["rules_text"])
+                    old = db.execute("SELECT version FROM rules WHERE approver=?", (paired["id"],)).fetchone()
+                    if payload["approver"] != paired["id"] or type(payload["version"]) is not int or (old and payload["version"] <= old[0]) \
+                            or not all(protocol.valid_rule(rule) for rule in payload["rules"]):
+                        continue
+                    db.execute("INSERT OR REPLACE INTO rules VALUES(?,?,?)", (paired["id"], payload["version"], entry["rules_text"]))
+                    self.audit(db, "rules_updated")
+                except Exception:
+                    continue
+        return True
+
     def settle(self, token, out):
         """Give a just-submitted request a moment to be rejected automatically, so the
         caller sees the reason in this answer instead of a bare pending."""
@@ -293,7 +340,7 @@ class Injector:
             if state == "approved" and row["kind"] == "use":
                 self.execute(row["id"], answer)
             elif state == "approved":
-                self.grant_reference(row["id"], answer)
+                self.grant(row["id"], answer)
             else:
                 with self.tx() as db:
                     final = state if state in {"denied", "expired"} else "revoked"
@@ -301,9 +348,10 @@ class Injector:
                     db.execute("UPDATE requests SET state=?,reason=? WHERE id=? AND state='pending'", (final, reason, row["id"]))
                     self.audit(db, final, row["id"], row["task"])
 
-    def grant_reference(self, request_id, answer):
+    def grant(self, request_id, answer):
+        """An approved reference becomes a ref; an approved read lets the hook pass that one tool call."""
         with self.tx() as db:
-            row = db.execute("SELECT * FROM requests WHERE id=? AND kind='reference' AND state='pending'", (request_id,)).fetchone()
+            row = db.execute("SELECT * FROM requests WHERE id=? AND kind IN ('reference','access') AND state='pending'", (request_id,)).fetchone()
             if not row:
                 return False
             task = db.execute("SELECT * FROM tasks WHERE id=? AND active=1 AND expires>?", (row["task"], self.clock())).fetchone()
@@ -311,13 +359,17 @@ class Injector:
                 self.approver_key(db, answer["approver"], row["request_text"], answer["signature"])
                 if not task or json.loads(row["request_text"])["expires_at"] <= self.clock():
                     raise GuardError("expired")
-                kind = json.loads(row["request_text"])["details"]["type"]
-                if kind not in protocol.REF_TYPES:
+                kind = json.loads(row["request_text"])["details"]["type"] if row["kind"] == "reference" else None
+                if row["kind"] == "reference" and kind not in protocol.REF_TYPES:
                     raise GuardError("request_invalid")
             except Exception as exc:
                 db.execute("UPDATE requests SET state='revoked',reason=? WHERE id=?", ("approver_not_paired" if str(exc) == "device_unauthorized" else None, request_id))
                 self.audit(db, "approval_rejected", request_id, row["task"])
                 return False
+            if row["kind"] == "access":
+                db.execute("UPDATE requests SET state='approved' WHERE id=?", (request_id,))
+                self.audit(db, "read_approved", request_id, task["id"])
+                return True
             ref = opaque("secretref://r_")
             # The expiry is fixed here, when the approval arrives, and reported in status.
             db.execute("INSERT INTO refs VALUES(?,?,?,?,?,1,?,0)", (ref, task["id"], row["alias"], answer["approver"], min(self.clock() + protocol.REF_TTL, task["expires"]), kind))

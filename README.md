@@ -53,6 +53,8 @@ agent API 在 `http://127.0.0.1:8765`，审批页面在 `http://127.0.0.1:8766`�
 
 ## 两层保护
 
+2026-11-20 起的产品方向：不提供沙盒。MCP 在 agent 主动要求使用密码时启用；hook 是底层防线，agent 用自带工具读取用户在审批端标记为受保护的内容时，自动触发审批。拆分部署下的用法见 [docs/split-architecture.md](docs/split-architecture.md) 的“两条路”一节。下面是 v0.1 单进程 broker 的说明。
+
 1. **第 1 层：阻止 agent 读取本地密码。** agent 自带的文件和 shell 工具不能打开 broker 状态目录、vault 密钥、task token。Claude Code 用 PreToolUse hook 实现，Codex 用它的 OS 沙箱读取禁令加同一个 hook 实现。本产品不提供沙盒或 OS 隔离：hook 是底层防线，拦的是经过 agent 工具调用的读取。
 2. **第 2 层：通过 MCP 服务让 agent 使用密码。** agent 只拿到任务 token 和不透明引用，broker 在审批通过后代为发出请求并注入真实凭据，明文不进入 agent。
 

@@ -152,6 +152,70 @@ class ClaudeHookTests(unittest.TestCase):
         self.assertIsNotNone(self.check("Bash", cwd=self.state, command="ls"))
         self.assertIsNotNone(self.check("Monitor", cwd=self.home, command="ls"))
 
+    def rule(self, kind, value, tool, cwd=None, **tool_input):
+        event = {"tool_name": tool, "tool_input": tool_input, "cwd": str(cwd or self.work)}
+        return claude_hook.match_rule(event, [{"kind": kind, "value": value}], home=str(self.home))
+
+    def test_user_rules_match_reads_of_protected_content(self):
+        (self.work / ".env").write_text("secret=a")
+        (self.home / ".aws").mkdir()
+        (self.home / ".aws/credentials").write_text("synthetic")
+        hit, miss = self.assertIsNotNone, self.assertIsNone
+        # A file name, wherever the file is.
+        hit(self.rule("path", ".env", "Read", file_path=str(self.work / ".env")))
+        hit(self.rule("path", ".env", "Bash", command="cat .env"))
+        hit(self.rule("path", ".env", "Bash", command="cat ./src/../.e''nv"))
+        hit(self.rule("path", ".env", "Bash", command="bash -c 'source .env && env'"))
+        hit(self.rule("path", ".env", "Grep", pattern="secret", path="."))
+        hit(self.rule("path", ".env", "Bash", command="grep -r secret ."))
+        hit(self.rule("path", "*.pem", "Read", file_path="certs/server.PEM"))
+        miss(self.rule("path", ".env", "Read", file_path="src/main.py"))
+        miss(self.rule("path", ".env", "Bash", command="ls -la && make test"))
+        miss(self.rule("path", ".env", "Grep", pattern="secret", path="src"))
+        miss(self.rule("path", ".env", "Edit", file_path="src/app.js", old_string="a", new_string="const x = process.env.PORT\n"))
+        miss(self.rule("path", "*.pem", "Read", file_path="docs/pem.md"))
+        # A fixed path: reads of it and tree scans above it, but not every command run nearby.
+        hit(self.rule("path", "~/.aws", "Read", file_path=str(self.home / ".aws/credentials")))
+        hit(self.rule("path", "~/.aws", "Bash", command="cat ~/.aws/credentials"))
+        hit(self.rule("path", "~/.aws", "Bash", command="cat $HOME/.aws/credentials", cwd=self.work))
+        hit(self.rule("path", "~/.aws", "Bash", command="tar czf /tmp/h.tgz " + str(self.home)))
+        hit(self.rule("path", str(self.work / ".env"), "Bash", command="rg secret"))
+        miss(self.rule("path", str(self.work / ".env"), "Bash", command="python3 src/main.py"))
+        miss(self.rule("path", "~/.aws", "Bash", command="ls " + str(self.home)))
+        miss(self.rule("path", "~/.aws", "Read", file_path=str(self.home / "notes/a.md")))
+        # A string that may not appear in a tool call.
+        hit(self.rule("text", "GITHUB_TOKEN", "Bash", command="echo $github_token"))
+        hit(self.rule("text", "GITHUB_TOKEN", "Bash", command="printenv GITHUB_'TOKEN'"))
+        hit(self.rule("text", "secret=", "Grep", pattern="secret=", path="src"))
+        miss(self.rule("text", "GITHUB_TOKEN", "Bash", command="git status"))
+        miss(self.rule("path", ".env", "mcp__secret_guard__guard_operation_status", operation_id=".env"))
+
+    def test_a_matching_call_waits_for_the_users_decision(self):
+        token = self.token
+        answers, calls = [], []
+
+        def call(url, bearer, route, body):
+            calls.append((route, body))
+            if route == "/rules":
+                return {"rules": [{"kind": "path", "value": ".env"}]}
+            return answers.pop(0)
+        event = {"tool_name": "Bash", "tool_input": {"command": "cat .env"}, "cwd": str(self.work)}
+        run = lambda e=event: claude_hook.guarded(e, "http://127.0.0.1:1", str(token), wait=3, call=call)
+        self.assertIsNone(run({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": str(self.work)}))
+        self.assertEqual([c[0] for c in calls], ["/rules"])  # Nothing is requested for an ordinary call.
+        answers[:] = [{"operation_id": "op_1", "state": "pending"}, {"operation_id": "op_1", "state": "approved"}]
+        self.assertIsNone(run())
+        access = next(body for route, body in calls if route == "/access")
+        self.assertEqual((access["tool"], access["rule"], access["summary"]), ("Bash", {"kind": "path", "value": ".env"}, "cat .env"))
+        answers[:] = [{"operation_id": "op_2", "state": "denied", "reason": "user_denied", "message": "用户拒绝了这次请求"}]
+        self.assertIn("用户拒绝了这次请求", run())
+        answers[:] = [{"operation_id": "op_3", "state": "pending"}] * 10
+        self.assertIn("no answer yet", run())
+        # No injector, no decision: the call is blocked.
+        proc = subprocess.run([sys.executable, "-I", claude_hook.__file__, "--protect", str(self.state), "--guard-url", "http://127.0.0.1:9", "--token-file", str(token)],
+                              input=json.dumps(event), capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 2)
+
     def test_secret_guard_tools_pass(self):
         self.allowed("mcp__secret_guard__guard_request_reference", alias="github", repo="acme/payments")
         self.denied("mcp__other__read", path=str(self.token))

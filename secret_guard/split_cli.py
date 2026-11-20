@@ -57,6 +57,18 @@ def parser():
     s = sub.add_parser("serve")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--agent-port", type=int, default=8765)
+    s = sub.add_parser("claude-config", help="Write a per-task Claude Code --mcp-config file and the --settings file that installs the hook")
+    s.add_argument("--url", default="http://127.0.0.1:8765")
+    s.add_argument("--token-file", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--settings-out", required=True)
+    s.add_argument("--protect", action="append", default=[], help="Extra path the hook must always refuse (repeatable)")
+    s = sub.add_parser("codex-config", help="Write a per-task Codex launcher: MCP server, sandbox read-deny profile and the hook")
+    s.add_argument("--url", default="http://127.0.0.1:8765")
+    s.add_argument("--token-file", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--codex", default="codex")
+    s.add_argument("--protect", action="append", default=[])
     s = sub.add_parser("revoke")
     s.add_argument("kind", choices=["task", "approver", "operation"])
     s.add_argument("identity")
@@ -75,6 +87,12 @@ def parser():
     s = sub.add_parser("secret-add")
     s.add_argument("alias")
     s.add_argument("--repo", action="append", required=True)
+    for name, text in (("protect-add", "Require approval before the agent's own tools read this"), ("protect-remove", "Stop protecting this")):
+        s = sub.add_parser(name, help=text)
+        group = s.add_mutually_exclusive_group(required=True)
+        group.add_argument("--path", help="A file, directory or file-name pattern: ~/.aws, .env, *.pem")
+        group.add_argument("--text", help="A string that may not appear in a tool call, e.g. an environment variable name")
+    sub.add_parser("protect-list")
     sub.add_parser("run", help="Show pending requests and approve or deny each at the keyboard")
     s = sub.add_parser("revoke")
     s.add_argument("kind", choices=["secret", "injector"])
@@ -99,7 +117,12 @@ def read_pairing(path, kind):
 
 def describe(payload):
     lines = [f"  项目 {payload['project']} · 任务 {payload['task']} · 凭据 {payload['secret_id']}"]
-    if payload["kind"] == "use":
+    if payload["kind"] == "access":
+        d = payload["details"]
+        lines = [f"  项目 {payload['project']} · 任务 {payload['task']}",
+                 f"  命中保护规则 {'文件' if d['rule']['kind'] == 'path' else '字符串'} {d['rule']['value']}",
+                 f"  工具 {d['tool']} · 调用 {d['summary']!r}", "  批准后，这次调用读到的内容会进入 agent 的上下文"]
+    elif payload["kind"] == "use":
         d = payload["details"]
         lines.append(f"  操作 {d['method']} https://{d['host']}{d['path']}?{d['query']}")
     else:
@@ -110,6 +133,7 @@ def describe(payload):
 
 
 def approve_loop(approver):
+    approver.publish_rules()
     print("审批端已连接。Ctrl-C 退出。", flush=True)
     seen = set()
     while True:
@@ -118,7 +142,7 @@ def approve_loop(approver):
                 continue
             seen.add(item["request_id"])
             payload = item["payload"]
-            print("\n" + ("允许这一次具体使用？" if payload.get("kind") == "use" else "允许任务引用凭据？"))
+            print("\n" + {"use": "允许这一次具体使用？", "access": "agent 的工具调用要读取受保护内容，允许这一次？"}.get(payload.get("kind"), "允许任务引用凭据？"))
             if item["problem"]:
                 # Rules come before the prompt: a forbidden request is rejected with its reason, never offered.
                 print(f"  {'已自动拒绝并告知调用方' if item['rejected'] else '不能批准'}：{protocol.explain(item['problem'])}")
@@ -174,6 +198,10 @@ def main():
                         injector.revoke("task", task["task_id"])
                     raise
                 print(json.dumps({"task_id": task["task_id"], "token_file": str(Path(args.token_file).resolve())}))
+            elif args.command in ("claude-config", "codex-config"):
+                from . import cli
+                guard = (args.url, args.token_file)
+                (cli.write_claude_config if args.command == "claude-config" else cli.write_codex_launcher)(args, args.state, guard)
             elif args.command == "serve":
                 from .split_server import serve_injector
                 serve_injector(injector, args.host, args.agent_port)
@@ -199,6 +227,15 @@ def main():
             elif args.command == "secret-add":
                 approver.add_secret(args.alias, getpass.getpass("密码（不回显；内容由你管理，按原样保存）: "), args.repo)
                 print("Credential stored on this approver.")
+            elif args.command in ("protect-add", "protect-remove"):
+                rule = approver.set_rule("path" if args.path else "text", args.path or args.text, args.command == "protect-add")
+                try:
+                    approver.publish_rules()
+                    print(json.dumps({"rule": rule, "published": True}, ensure_ascii=False))
+                except Exception:
+                    print(json.dumps({"rule": rule, "published": False, "note": "saved here; it reaches the injector when this approver next connects"}, ensure_ascii=False))
+            elif args.command == "protect-list":
+                print(json.dumps(approver.list_rules(), indent=2, ensure_ascii=False))
             elif args.command == "run":
                 approve_loop(approver)
             elif args.command == "revoke":

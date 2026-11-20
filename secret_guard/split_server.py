@@ -108,8 +108,12 @@ def serve_injector(injector, host="127.0.0.1", agent_port=8765, interval=1.0):
     stop = threading.Event()
 
     def worker():
+        tick = 0
         while not stop.wait(interval):
             try:
+                if tick % 5 == 0:
+                    injector.sync_rules()  # Protection rules set on the approver, for the agent hook.
+                tick += 1
                 injector.run_ready()
             except Exception:
                 pass  # Fail closed; no values or exception messages logged.

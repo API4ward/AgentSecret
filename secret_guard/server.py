@@ -78,6 +78,11 @@ def handler(broker, role):
                         result = broker.workflow(token, **body)
                     elif self.path == "/status" and set(body) == {"operation_id"}:
                         result = broker.status(token, body["operation_id"])
+                    # Used by the agent hook; only the injector backend has them.
+                    elif self.path == "/rules" and not body and hasattr(broker, "rules"):
+                        result = broker.rules(token)
+                    elif self.path == "/access" and set(body) == {"tool", "rule", "summary", "call"} and hasattr(broker, "access"):
+                        result = broker.access(token, **body)
                     else:
                         raise GuardError("route_unavailable")
                 else:

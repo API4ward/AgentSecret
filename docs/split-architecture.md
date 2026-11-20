@@ -56,6 +56,54 @@ agent 仍然通过原有的 MCP bridge（`secret-guard mcp`）连接，三个工
 
 审批端不解释也不限制密码内容：任意字符、任意长度按原样保存，只拒绝空值。唯一的上限是一次密封转发的 64 KB。别名（1 到 64 个字母、数字、点、下划线、连字符）用来区分每条密码，校验失败时分别提示是别名、密码还是仓库的问题。只读 GitHub adapter 发请求时仍要求 token 是可见 ASCII，这是 adapter 的限制，不符合时该次使用结果为 `unknown`。
 
+## 两条路：agent 主动申请，或读取时被拦下
+
+| | 什么时候启用 | 机制 |
+| --- | --- | --- |
+| MCP | agent 主动要求使用密码 | 上面的两阶段流程：引用，再逐次使用。密码由注入工具代为注入，明文不进入 agent。 |
+| hook | agent 用自带工具（读文件、搜索、shell）去读受保护内容 | 底层防线。hook 拦下这次工具调用，自动向审批端发起审批，用户批准后这一次调用才执行。 |
+
+本产品不提供沙盒或 OS 隔离。hook 匹配的是工具调用的文本，拦不住不经过 agent 工具的进程。
+
+### 受保护内容在审批端设置
+
+```sh
+agentsecret approver protect-add --path .env             # 文件名或通配，任何目录下都算
+agentsecret approver protect-add --path '~/.aws'         # 固定的文件或目录
+agentsecret approver protect-add --text GITHUB_TOKEN     # 不允许出现在工具调用里的字符串
+agentsecret approver protect-list
+agentsecret approver protect-remove --path .env
+```
+
+浏览器审批端在“受保护内容”一栏做同样的事。规则不是密码，只是“什么需要审批”。审批端对整套规则签名（`secret-guard/rules/v1:` + 规则文本，带递增版本号），经 server 下发；注入工具只接受已配对审批端签名的规则，版本号不能回退，所以 server 既编不出规则，也不能换回旧规则。注入工具每 5 秒同步一次。
+
+### 给 agent 装上 hook
+
+```sh
+agentsecret injector claude-config --token-file /absolute/path/run-01.token \
+  --out /absolute/path/run-01.mcp.json --settings-out /absolute/path/run-01.settings.json
+claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config --settings /absolute/path/run-01.settings.json
+
+agentsecret injector codex-config --token-file /absolute/path/run-01.token --out /absolute/path/run-01.codex
+/absolute/path/run-01.codex
+```
+
+生成的 PreToolUse hook（`secret_guard/claude_hook.py`，Claude Code 与 Codex 共用）对每次工具调用做两件事：
+
+1. 调用碰到 AgentSecret 自己的状态（注入工具状态目录、token 文件、配置文件、可信 CLI）时直接拒绝，不提供审批。
+2. 否则向注入工具取当前规则。命中规则时，把工具名、命中的规则和调用摘要（最多 300 字符）作为一次 `access` 请求签名提交，审批端出现“agent 要读取受保护内容，允许这一次？”。hook 最多等 110 秒：批准则放行这一次调用，拒绝、超时或注入工具不可达都拦下，并把原因告诉 agent。
+
+批准只对那一次调用有效，同样的调用再来一次是新的请求；用户拒绝过的同一调用在任务内保持拒绝。批准读取意味着内容会进入 agent 的上下文，审批卡片上有这句提示。
+
+### 匹配范围和已知缺口
+
+- 文件名规则（`.env`、`*.pem`）：工具参数或命令里出现这个文件名；Grep 工具和递归读取的命令（`grep -r`、`rg`、`find`、`tar`、`cp -r` 等）会在搜索根目录下查找有没有这样的文件（最多看 2 万个条目）。
+- 固定路径规则（`~/.aws`）：读取该路径或其下的文件，符号链接、`..`、`$HOME`、通配写法都算；对它上层目录的递归读取也算。
+- 字符串规则：工具调用的参数里出现该字符串（不分大小写，去掉引号后也比对）。
+- **hook 在调用之前判断，看不到文件内容。** 没有被规则覆盖的文件里即使写着 `secret=a`，读它不会触发审批。要保护就把文件或文件名加进规则。
+- 运行时才拼出来的路径、先写脚本再执行、不经过 agent 工具的进程，都拦不住。
+- 注入工具没有运行时，装了 hook 的 agent 的所有工具调用都会被拦下（宁可拦错）。
+
 ## 签名与密封
 
 - 注入工具签名的内容：`secret-guard/request/v1:` + 请求文本。
@@ -97,7 +145,7 @@ secret-guard mcp --token-file /absolute/path/run-01.token
 
 ## 已验证
 
-`python -m unittest tests.test_split`，18 条，全部使用进程内或本机回环的 server：
+`python -m unittest tests.test_split`，21 条，全部使用进程内或本机回环的 server：
 
 | 检查 | 结果 |
 | --- | --- |
@@ -113,8 +161,10 @@ secret-guard mcp --token-file /absolute/path/run-01.token
 | 拒绝保持、过期、跨任务引用、撤销审批端、结果回显密码、崩溃恢复为 unknown | 通过 |
 | 原有 MCP bridge 直接连注入工具 | 通过 |
 | HTTP 往返，server 没有注册、导出类路由 | 通过 |
+| 审批端设置规则，签名下发；server 伪造或回放旧规则 | 注入工具只认已配对审批端的新版本 |
+| 真实 hook 进程：普通调用放行；`cat .env` 等到审批端批准才放行；拒绝则拦下并带原因；自身状态直接拒绝 | 通过 |
 
-浏览器审批端另用无头 Chromium 手动跑通了一遍：照页面“设置步骤”打印的命令逐条执行完成登记和配对，录入假密码（含空格的 3 字符密码），批准一次性引用和一次使用，Python 注入工具解开并使用了页面密封的密码；未知密码和策略外仓库的请求被页面自动拒绝，调用方拿到了原因。这一遍没有纳入自动测试。
+浏览器审批端另用无头 Chromium 手动跑通了一遍：照页面“设置步骤”打印的命令逐条执行完成登记和配对，录入假密码（含空格的 3 字符密码），批准一次性引用和一次使用，Python 注入工具解开并使用了页面密封的密码；未知密码和策略外仓库的请求被页面自动拒绝，调用方拿到了原因。这一遍没有纳入自动测试。2026-11-20 又用同样的方式跑了读取审批：在页面上加规则 `.env` 和 `GITHUB_TOKEN`，`claude-config` 生成的 hook 对 `cat .env` 等到页面点批准后放行，对 `echo $GITHUB_TOKEN` 在页面点拒绝后拦下。hook 没有在真实的 Claude Code 或 Codex 会话里跑过这条新路径。
 
 ## 与架构文档的差别和未完成项
 
@@ -127,5 +177,5 @@ secret-guard mcp --token-file /absolute/path/run-01.token
 - **注入工具只过滤它这次用到的那一条密码的回显。** v0.1 的 broker 知道全部密码，可以全部比对；注入工具不保存密码，做不到。
 - **凭据更新不会自动作废已发的引用。** 审批端每次批准时取当前值。
 - **只有一个只读 GitHub adapter**，没有出网代理式的注入。
-- agent 与注入工具同一系统用户时，注入工具的状态目录（设备私钥、任务数据库）需要靠 hook 或 OS 隔离保护。hook 分支的受保护路径还没有指向这个目录。
+- agent 与注入工具同一系统用户时，注入工具的状态目录（设备私钥、任务数据库）靠 hook 保护：`injector claude-config` / `codex-config` 生成的 hook 已把它列为直接拒绝的路径。同账户下有意绕过 hook 的进程不在防护范围内。
 - 2026-10-24 审查确认的 TLS 握手阻塞问题仍在 agent 监听端口上。
