@@ -144,6 +144,12 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("用户拒绝了这次请求", err)
         self.assertFalse((self.work / "denied.txt").exists())
 
+    def test_any_length_of_credential_is_detected(self):
+        # How strong a credential is, is the user's decision; nothing is skipped for being short.
+        self.secrets(pin="7", code="ab1")
+        (self.work / "p.txt").write_text("pin 7 code ab1")
+        self.assertEqual(self.read(self.work / "p.txt"), "pin {{secretref:pin}} code {{secretref:code}}")
+
     def test_no_answer_and_no_injector_both_withhold(self):
         self.secrets(age="18year")
         self.answer = lambda item: None
