@@ -33,15 +33,27 @@ Codex 用 macOS seatbelt 沙箱运行模型发起的每条 shell 命令，读取
 
 MCP bridge 由 Codex 自身在沙箱外启动，所以仍能读到 token 文件。
 
-**PreToolUse hook（补充）。** Codex 0.166.0 的 hooks 功能为 stable，输入输出格式与 Claude Code 相同，脚本注册的是同一个 `secret_guard/claude_hook.py`，规则见 [claude-code.md](claude-code.md)。它在沙箱之外多挡一层，并拒绝运行 `secret-guard` 可信 CLI。
+**PreToolUse / PostToolUse hook（补充）。** Codex 0.166.0 的 hooks 功能为 stable，输入格式与 Claude Code 相同，输出格式有差别（见下文），脚本注册的是同一个 `secret_guard/claude_hook.py`，规则见 [claude-code.md](claude-code.md)。它在沙箱之外多挡一层，并拒绝运行 `secret-guard` 可信 CLI。
 
 ### 限制
 
-- **hook 在 Codex 下未实测。** 本机 Codex 的工具执行当前不可用：不带任何 Secret Guard 配置的 `codex exec` 执行 shell 命令也报 `timed out negotiating with the code-mode host`，因此没有一次真实的模型工具调用可以用来验证 hook 是否触发，也没有验证经 MCP 的完整闭环。Codex 可能要求先在 `/hooks` 里信任该 hook 才运行它。在这之前，Codex 的第 1 层应视为只靠沙箱。
+- **hook 已在真实 Codex 会话里实测（2026-11-20，codex-cli 0.166.0）。** 结论见下一节。
 - 沙箱只约束模型发起的命令。加了 `-s danger-full-access` 或 `--dangerously-bypass-approvals-and-sandbox` 就没有这层保护。交互模式下模型可以申请让某条命令脱离沙箱，批准与否由用户决定，不要批准读取受保护路径的命令。
 - 读取禁令的实测只在 macOS 上做过。Linux 上 Codex 用 Landlock 和 seccomp，未验证。
 - 其他 MCP 服务器、Codex 的 hosted 工具不经过沙箱。
 - 沙箱和 hook 都在 agent 所在的 OS 账户内配置。有意绕过整个 Codex 的进程不在防护范围内，本产品不提供沙盒。
+
+## hook 在真实 Codex 里的表现
+
+2026-11-20 用真实 `codex exec` 会话和测试值 `18year` 验证，可用 `AGENTSECRET_REAL_CODEX=1 python -m unittest tests.test_scenarios` 重跑。
+
+- **Codex 不运行未被信任的 hook，也不提示。** 用 `-c` 传入的 hook 在 `codex exec` 里没有地方可以信任，所以启动脚本带上 `--dangerously-bypass-hook-trust`。不带它时 hook 一次都不会被调用，密码原样到达模型。
+- **Codex 不接受 `updatedToolOutput`。** 它把这种回答判为无效（`PostToolUse Failed`），然后把原始结果交给模型。它接受的是 `{"decision":"block","reason":…}`：`reason` 会取代工具结果。hook 带 `--agent codex` 时按这种格式回答，批准后模型看到 `{{secretref:别名}}`，拒绝或 hook 出错时看到“已扣留”。
+- **填入可用。** shell 命令和 `apply_patch` 里的引用都会触发 fill 审批，批准后经 `updatedInput` 换成密码再执行。
+- **没有挡住的：**
+  - 输出被变形后匹配不到。实测 `rev example/qa.txt` 不触发审批，模型自己把它还原出了密码。base64、逐字符拆开等同理。匹配器只认原样的字节。
+  - Codex 自己把命令的原始输出和填入后的命令写进 `~/.codex/sessions/` 下的会话记录（`event_msg`），终端里也会显示。交给模型的那一份（`response_item`）只有引用。
+  - 路径规则有误拦：`sed 's/./&_/g' example/qa.txt` 被判成“触及受保护路径”而拒绝。
 
 ## 第 2 层：通过 MCP 使用密码
 

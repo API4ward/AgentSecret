@@ -1,4 +1,4 @@
-"""PreToolUse and PostToolUse hook for Claude Code and Codex (same wire format).
+"""PreToolUse and PostToolUse hook for Claude Code and Codex (same input; `--agent codex` selects Codex's output).
 
 Before a tool runs: calls that touch AgentSecret's own state (--protect) are
 refused outright, and a call that carries a credential reference such as
@@ -236,6 +236,15 @@ def reveal(event, url, token, wait=WAIT_SECONDS, call=None):
     return rewrite(response, texts)
 
 
+def replaced(result, agent):
+    """The hook answer that puts `result` where the model would have seen the tool result."""
+    if agent == "codex":
+        # Codex rejects updatedToolOutput as invalid and then hands the model the original result.
+        # It does accept a blocked result, and the reason given takes the place of the tool result.
+        return {"decision": "block", "reason": result if isinstance(result, str) and result.strip() else json.dumps(result, ensure_ascii=False)}
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": result}}
+
+
 def post(url, token, route, body):
     parts = urlsplit(url)
     if parts.scheme not in {"http", "https"} or (parts.scheme == "http" and parts.hostname not in {"127.0.0.1", "localhost"}):
@@ -254,9 +263,11 @@ def main(argv=None):
     # PreToolUse: exit 2 blocks the call and shows stderr to the model; any failure blocks too.
     # PostToolUse: the tool already ran, so a failure withholds its result instead.
     event = {}
+    argv = sys.argv[1:] if argv is None else argv
+    # Known before anything can fail: a failure must still be answered in the agent's own format.
+    agent = "codex" if ["--agent", "codex"] in [argv[i:i + 2] for i in range(0, len(argv), 2)] else None
     try:
-        argv = sys.argv[1:] if argv is None else argv
-        options = {"--protect": [], "--guard-url": [], "--token-file": []}
+        options = {"--protect": [], "--guard-url": [], "--token-file": [], "--agent": []}
         if len(argv) % 2:
             raise ValueError
         for flag, value in zip(argv[::2], argv[1::2]):
@@ -268,7 +279,7 @@ def main(argv=None):
         if event.get("hook_event_name") == "PostToolUse":
             changed = reveal(event, *guard) if guard else None
             if changed is not None:
-                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": changed}}))
+                print(json.dumps(replaced(changed, agent)))
             return
         reason = Policy(options["--protect"]).check(event)
         message = MESSAGE.format(reason) if reason else None
@@ -280,7 +291,7 @@ def main(argv=None):
                                                          "permissionDecisionReason": "AgentSecret: approved on the user's approver", "updatedInput": changed}}))
     except Exception:
         if event.get("hook_event_name") == "PostToolUse":
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": WITHHELD.format("hook could not check this result")}}))
+            print(json.dumps(replaced(WITHHELD.format("hook could not check this result"), agent)))
             return
         message = MESSAGE.format("hook could not evaluate this call")
     if message:
