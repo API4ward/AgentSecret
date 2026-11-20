@@ -3,6 +3,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 
 
@@ -35,15 +36,21 @@ def parser():
     s.add_argument("--approval-port", type=int, default=8766)
     s.add_argument("--cert")
     s.add_argument("--key")
-    s.add_argument("--agent-socket", help="Serve the agent API on this Unix socket instead of TCP (isolated worker domain)")
-    s.add_argument("--container-approval-bind", help="Bind address inside a broker container whose approval port is published to host loopback only")
     s = sub.add_parser("mcp")
-    s.add_argument("--url", default="http://127.0.0.1:8765", help="Broker agent API; unix:///absolute/path.sock inside an isolated worker")
+    s.add_argument("--url", default="http://127.0.0.1:8765", help="Broker or injector agent API")
     s.add_argument("--token-file", required=True)
     s = sub.add_parser("claude-config", help="Write a per-task Claude Code --mcp-config file")
     s.add_argument("--url", default="http://127.0.0.1:8765")
     s.add_argument("--token-file", required=True)
     s.add_argument("--out", required=True)
+    s.add_argument("--settings-out", help="Also write a --settings file whose PreToolUse hook keeps Claude's own tools away from broker state and the token")
+    s.add_argument("--protect", action="append", default=[], help="Extra path the hook must refuse, e.g. the approval browser profile (repeatable)")
+    s = sub.add_parser("codex-config", help="Write a per-task Codex launcher: MCP server, sandbox read-deny profile and PreToolUse hook")
+    s.add_argument("--url", default="http://127.0.0.1:8765")
+    s.add_argument("--token-file", required=True)
+    s.add_argument("--out", required=True, help="Launcher script; run it in place of `codex`")
+    s.add_argument("--codex", default="codex")
+    s.add_argument("--protect", action="append", default=[], help="Extra path the agent must not read (repeatable)")
     return p
 
 
@@ -55,6 +62,73 @@ def claude_mcp_config(token_file, url="http://127.0.0.1:8765"):
             "env": {"PYTHONPATH": str(Path(__file__).resolve().parent.parent)}}}}
 
 
+def claude_settings(protect, guard=None):
+    # Guardrail, not a boundary: the hook runs as the agent's own OS user.
+    # guard = (injector URL, token file): the hook also asks the injector for the rules set on
+    # the approver and waits for the user's decision when a tool call would read protected content.
+    protect = [str(Path(p).expanduser().resolve()) for p in protect]
+    hook = [sys.executable, "-I", str(Path(__file__).resolve().with_name("claude_hook.py"))]
+    command = shlex.join(hook + [x for p in protect for x in ("--protect", p)]
+                         + (["--guard-url", guard[0], "--token-file", str(Path(guard[1]).resolve())] if guard else []))
+    deny = [f"{tool}(/{p}{suffix})" for p in protect for tool in ("Read", "Edit") for suffix in ("", "/**")]
+    return {"permissions": {"deny": deny},
+            "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 130 if guard else 10}]}]}}
+
+
+def toml(value):
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{json.dumps(k)}={toml(v)}" for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(toml(v) for v in value) + "]"
+    return json.dumps(value)
+
+
+def codex_overrides(token_file, protect, url="http://127.0.0.1:8765", guard=None):
+    # Passed as -c overrides so the user's ~/.codex/config.toml is never edited.
+    # The sandbox profile is the enforcing part: Codex applies it to every shell
+    # command through the OS sandbox, however the path is spelled.
+    server = claude_mcp_config(token_file, url)["mcpServers"]["secret_guard"]
+    return {"mcp_servers.secret_guard": {k: server[k] for k in ("command", "args", "env")},
+            "permissions.secret_guard.extends": ":workspace",
+            "permissions.secret_guard.filesystem": {str(Path(p).expanduser().resolve()): "none" for p in protect},
+            "default_permissions": "secret_guard",
+            "hooks.PreToolUse": claude_settings(protect, guard)["hooks"]["PreToolUse"]}
+
+
+def exclusive_json(path, value):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(value, f, indent=2)
+
+
+def write_claude_config(args, state, guard=None):
+    # No broker access; refuse overwrite like task-create.
+    if not Path(args.token_file).is_file():
+        sys.exit("Token file not found; run task-create first.")
+    exclusive_json(args.out, claude_mcp_config(args.token_file, args.url))
+    written = {"mcp_config": str(Path(args.out).resolve())}
+    if args.settings_out:
+        # The package directory is protected so the hook cannot be edited away mid-session.
+        protect = [state, args.token_file, args.out, args.settings_out, Path(__file__).resolve().parent, *args.protect]
+        exclusive_json(args.settings_out, claude_settings(protect, guard))
+        written["settings"] = str(Path(args.settings_out).resolve())
+    print(json.dumps(written))
+
+
+def write_codex_launcher(args, state, guard=None):
+    if not Path(args.token_file).is_file():
+        sys.exit("Token file not found; run task-create first.")
+    protect = [state, args.token_file, args.out, Path(__file__).resolve().parent, *args.protect]
+    overrides = codex_overrides(args.token_file, protect, args.url, guard)
+    lines = ["#!/bin/sh", "# Generated for one task. Holds the token file path, never the token.",
+             "exec " + shlex.quote(args.codex) + " \\"]
+    lines += [f"  -c {shlex.quote(key + '=' + toml(value))} \\" for key, value in overrides.items()]
+    fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines + ['  "$@"']) + "\n")
+    print(json.dumps({"launcher": str(Path(args.out).resolve())}))
+
+
 def main():
     args = parser().parse_args()
     if args.command == "mcp":
@@ -63,13 +137,10 @@ def main():
         run(args.url, Path(args.token_file).read_text().strip())
         return
     if args.command == "claude-config":
-        # No broker access either; refuse overwrite like task-create.
-        if not Path(args.token_file).is_file():
-            sys.exit("Token file not found; run task-create first.")
-        fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(claude_mcp_config(args.token_file, args.url), f, indent=2)
-        print(json.dumps({"mcp_config": str(Path(args.out).resolve())}))
+        write_claude_config(args, args.state)
+        return
+    if args.command == "codex-config":
+        write_codex_launcher(args, args.state)
         return
     from .broker import Broker, GuardError
     try:
@@ -103,7 +174,7 @@ def main():
             print(json.dumps(broker.activity(), indent=2))
         elif args.command == "serve":
             from .server import serve
-            serve(broker, args.host, args.agent_port, args.approval_port, args.cert, args.key, args.agent_socket, args.container_approval_bind)
+            serve(broker, args.host, args.agent_port, args.approval_port, args.cert, args.key)
     except KeyboardInterrupt:
         pass
     except GuardError as exc:

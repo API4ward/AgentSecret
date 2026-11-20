@@ -17,7 +17,7 @@
 | Claude Code 接入 | `claude-config` 生成按次 `--mcp-config`；`examples/claude_e2e.py` | 已实现；Claude Code 2.1.311 headless 假凭据闭环通过，子 agent 共享 task 身份已确认；见 [claude-code.md](claude-code.md) |
 | 故障恢复 | durable executing → unknown；无自动重试 | 已实现 |
 | 策略和撤销 | user/project/repo、task/device/secret/operation 撤销、版本变更失效 | 已实现 |
-| OS/网络边界 | `isolation/`：broker 与每任务 worker 分属不同容器，Unix socket agent 通道，默认无网络，可选出网白名单代理 | 已实现容器部署并通过假凭据绕过测试，见 [isolation.md](isolation.md)；宿主 Docker 控制账号属可信域 |
+| OS/网络边界 | 不提供。容器隔离部署（`isolation/`、guardctl）已于 2026-11-20 移除，产品不提供沙盒 | 不在范围内 |
 | 清洗工作区 | 设计第 9 节第二阶段 | 尚未实现 |
 | 严格消息保护与 Codex 适配 | 设计第 9 节第三阶段 | 尚未实现 |
 | issue 创建、更多 adapter | 后续有副作用操作 | 尚未实现；本版仅只读 |
@@ -44,7 +44,7 @@ task token 是独立运行的代理身份凭据，其 hash 存库；设备 sessi
 
 ## 后续严格版本必须完成
 
-1. ~~把 broker/审批浏览器与 worker 放入独立 OS 安全域；固定挂载、凭据路径与 egress，阻止 direct-network 与 HOME 读取绕过。~~ 2026-11-11 以容器部署完成，见 [isolation.md](isolation.md)；VM 级隔离与内容级出网检查仍未做。
+1. ~~把 broker/审批浏览器与 worker 放入独立 OS 安全域；固定挂载、凭据路径与 egress，阻止 direct-network 与 HOME 读取绕过。~~ 2026-11-11 曾以容器部署完成，2026-11-20 按产品方向移除：不提供沙盒，底层防线改为 agent hook。
 2. 实现工作区准入：历史/子模块/链接/二进制/缓存/环境都检查，已纳管值投影为占位符；原始文件不挂载 worker。未知候选隔离。
 3. 实现自有 App Server 客户端；先观察当前固定 Codex 版本的输入、工具输出、持久化和模型调用顺序，再定位内核过滤点。不能由 PostToolUse 或事件流过滤代替入口边界。
 4. 绑定真实 task/fork/subagent 生命周期；新增任务独立 ReferenceGrant，恢复/摘要重新校验权限。

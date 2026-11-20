@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, device TEXT, ex
 CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, user TEXT, injector TEXT, kind TEXT, expires REAL, request_text TEXT,
     signature TEXT, state TEXT, approver TEXT, approval TEXT, sealed TEXT);
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, event TEXT, request_id TEXT, device TEXT);
+CREATE TABLE IF NOT EXISTS rules(approver TEXT PRIMARY KEY, user TEXT, rules_text TEXT, signature TEXT);
 """
 # Columns added after the first prototype; applied to existing databases too.
 MIGRATIONS = ["ALTER TABLE requests ADD COLUMN reason TEXT", "ALTER TABLE requests ADD COLUMN declines TEXT"]
@@ -158,7 +159,7 @@ class Relay:
             if canonical(payload) != request_text or payload["domain"] != protocol.REQUEST_DOMAIN:
                 raise ValueError
             request_id, kind, expires = payload["request_id"], payload["kind"], payload["expires_at"]
-            if not IDENT.fullmatch(request_id) or kind not in {"reference", "use"} or type(expires) not in {int, float}:
+            if not IDENT.fullmatch(request_id) or kind not in {"reference", "use", "access"} or type(expires) not in {int, float}:
                 raise ValueError
         except Exception:
             raise GuardError("request_invalid") from None
@@ -200,6 +201,26 @@ class Relay:
                 # Signed by the approver, so the injector can show a reason the relay cannot invent.
                 out.update(approver=row["approver"], signature=row["approval"], reason=row["reason"] or "")
             return out
+
+    def rules(self, token):
+        """Protection rules of this user's approvers, each still carrying its approver's signature."""
+        with self.tx() as db:
+            injector = self.session(db, token, "injector")
+            rows = db.execute("SELECT r.* FROM rules r JOIN devices d ON d.id=r.approver WHERE r.user=? AND d.active=1", (injector["user"],)).fetchall()
+            return {"rules": [{"approver": r["approver"], "rules_text": r["rules_text"], "signature": r["signature"]} for r in rows]}
+
+    def publish_rules(self, token, rules_text, signature):
+        if not 0 < len(rules_text) <= protocol.MAX_RULES_TEXT:
+            raise GuardError("request_invalid")
+        with self.tx() as db:
+            approver = self.session(db, token, "approver")
+            try:
+                verify(json.loads(approver["jwk"]), protocol.rules_message(rules_text), signature)
+            except Exception:
+                raise GuardError("signature_invalid") from None
+            db.execute("INSERT OR REPLACE INTO rules VALUES(?,?,?,?)", (approver["id"], approver["user"], rules_text, signature))
+            self.audit(db, "rules_published", device=approver["id"])
+        return {"state": "published"}
 
     def report(self, token, request_id, event):
         if event not in REPORTS:
@@ -261,6 +282,8 @@ class Relay:
         "/injector/submit": ("submit", {"request_text", "signature"}, True),
         "/injector/poll": ("poll", {"request_id"}, True),
         "/injector/report": ("report", {"request_id", "event"}, True),
+        "/injector/rules": ("rules", set(), True),
+        "/approver/rules": ("publish_rules", {"rules_text", "signature"}, True),
         "/approver/pending": ("pending", set(), True),
         "/approver/decision": ("decide", {"request_id", "decision", "signature"}, True),
     }

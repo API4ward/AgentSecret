@@ -2,7 +2,7 @@
 
 日期：2026-11-11。验证版本：Claude Code 2.1.311（headless `claude -p`），实际模型 `claude-sonnet-5-5`。全部使用合成凭据和假 GitHub transport。
 
-Secret Guard 的 MCP 服务器不区分客户端，Claude Code 通过同一个 STDIO bridge 接入，broker 侧无需改动。本页说明接入方式、已实测的行为，以及 Claude Code 的子 agent、权限和 hooks 对任务身份与保证范围的影响。
+Secret Guard 的 MCP 服务器不区分客户端，Claude Code 通过同一个 STDIO bridge 接入，broker 侧无需改动。本页说明接入方式、已实测的行为，阻止 Claude 直接读取密钥的 hook 防线，以及子 agent 对任务身份的影响。
 
 ## 为一次任务建立连接
 
@@ -12,9 +12,13 @@ broker 的建立、凭据登记和审批设备配对与 [README](../README.md) �
 .venv/bin/secret-guard task-create --user alice --project payments \
   --agent claude-code --token-file /absolute/path/run-01.token
 .venv/bin/secret-guard claude-config \
-  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.mcp.json
-claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config
+  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.mcp.json \
+  --settings-out /absolute/path/run-01.settings.json
+claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config \
+  --settings /absolute/path/run-01.settings.json
 ```
+
+`--settings-out` 生成的设置文件装有 PreToolUse hook，阻止 Claude 用自带工具读取 broker 状态和 token，见下文“hook 防线”。token 和 broker 状态目录必须放在工作区之外。
 
 `claude-config` 生成的文件只包含 token 文件的路径，不包含 token，权限 0600，拒绝覆盖已有文件。broker 不在默认地址时给 `claude-config` 加 `--url`。生成内容如下：
 
@@ -68,12 +72,53 @@ broker 认的身份是 **持有该 token 的 MCP bridge 进程**，不是 Claude
 
 结论与 Codex 兼容版相同：身份粒度是独立 MCP 进程，Claude Code 没有向 STDIO MCP 服务器提供不可伪造的会话或子 agent 标识，逐子 agent 隔离需要运行时适配，当前不能承诺。
 
-## 权限和 hooks 不构成边界
+## hook 防线：阻止 Claude 读取密钥
 
-- **权限规则。** 可以在按次的 `--settings` 里用 `permissions.deny` 禁止读取 broker 状态目录和审批浏览器 profile，这能挡住模型的误操作，但不是安全边界：Bash、hooks、其他 MCP 服务器和子进程都以同一 OS 用户运行，绕过文件工具即可读取。真正的隔离依赖 OS 安全域（实现状态文档的后续第 1 项）。
-- **token 文件对 agent 可读。** bridge 以 agent 的用户身份运行，agent 能读到 token 文件。token 只能申请操作和查询本任务状态，不能批准、不能取明文。泄漏的后果是他人可冒用本任务申请操作并消耗审批注意力，已批准的引用也可被其使用来发起仍需逐次审批的 use 请求。
-- **hooks。** PreToolUse/PostToolUse hook 能看到 MCP 工具的入参和结果，即引用、operation_id 和已过滤的结果，看不到凭据。hook 是 worker 安全域内的 shell 命令，项目级 hook 来自工作区内容，不可信，因此不能把审批、过滤或身份判定放在 hook 里。PostToolUse 也不能替代入口过滤，这与产品设计的结论一致。本次没有编写或测试任何 hook。
-- **会话记录。** Claude Code 把对话写入 `~/.claude/projects/` 下的 jsonl，其中会有引用、operation_id 和操作结果。引用绑定任务且会过期，结果是白名单字段，凭据不会进入记录（实测输出流中未出现）。
+Secret Guard 的保护分两层：第 1 层阻止 agent 读取本地密码，第 2 层通过 MCP 服务让 agent 使用密码。本节是 Claude Code 的第 1 层，Codex 的做法见 [codex.md](codex.md)。
+
+MCP 只提供了一条不接触明文的调用路径，它不能阻止 Claude 用自带的 Read、Grep、Bash 直接打开 broker 的文件。这件事由 hook 负责：`claude-config --settings-out` 生成的设置文件注册一个匹配全部工具的 PreToolUse hook（`secret_guard/claude_hook.py`），调用触及受保护路径时以退出码 2 拒绝，工具不会执行。
+
+受保护路径：broker 状态目录（全局参数 `--state`）、本次的 token 文件、生成的 MCP 配置和设置文件、`secret_guard` 包目录（防止会话中改掉 hook 自身），以及用 `--protect` 追加的路径，例如审批浏览器 profile 和设备密钥：
+
+```sh
+.venv/bin/secret-guard --state /absolute/path/state claude-config ... \
+  --settings-out /absolute/path/run-01.settings.json --protect /absolute/path/approval-profile
+```
+
+各工具的判定：
+
+| 工具 | 拒绝条件 |
+|---|---|
+| Read、Edit、Write、NotebookEdit、未知工具 | 任一参数解析后落在受保护路径内，含相对路径、`..`、符号链接、大小写变体 |
+| Grep、Glob | 搜索根在受保护路径内，或是其上级目录；Glob 模式能匹配到受保护路径 |
+| Bash 及其他带 `command` 参数的工具 | 见下 |
+| `mcp__secret_guard__*` | 放行 |
+
+Bash 命令按以下规则检查，任一命中即拒绝：
+
+- 命令文本（去掉引号和反斜杠后）出现受保护路径、受保护文件的文件名，或可信 CLI 的名字（`secret-guard`、`secret_guard`、`agentsecret`）。agent 不应运行可信 CLI 或导入该包。
+- 任一词展开 `~`、`$HOME`、环境变量和命令内赋值的变量后，解析到受保护路径内，或解析到其上级目录（`grep -r x ~`、`find /`、`cd ~`）。相对路径同时按命令里出现的每个绝对路径解析，以覆盖 `cd dir && cat 相对路径`。
+- 通配符（`*`、`?`、`[]`、`{}`）能匹配到受保护路径或其上级。
+- 引号内嵌的绝对路径（如 `python -c "open('/…')"`）同样检查。
+- shell 的当前目录在受保护路径内或是其上级时，全部 Bash 调用被拒绝。因此 token 和状态目录要放在工作区之外，也不要在主目录下直接启动 Claude。
+
+设置文件同时写入 `permissions.deny` 规则作为第二层。hook 读不到输入、参数不合法或内部出错时一律拒绝。
+
+规则偏严，会误伤一些正常命令，例如 `cd ~`、`ls ..`（上级目录包含受保护路径时）和任何提到 `secret-guard` 字样的命令。
+
+### hook 挡不住什么
+
+hook 是对工具参数的字符串检查，和 agent 运行在同一个 OS 账户下，不是安全边界。已知挡不住的情况：
+
+- 路径在运行时才拼出来，命令文本里没有它。例如 `python3 -c 'open(chr(47)+…)'`、base64 解码后执行、先写脚本文件再运行、由未知变量或命令替换给出路径。测试 `test_known_bypass_is_documented_not_blocked` 记录了这一点。
+- 不经过 Claude 工具的进程：其他 MCP 服务器、agent 启动的后台进程、已在运行的程序。
+- hook 自身的运行环境同账户可写：Python 解释器、虚拟环境、用户级 Claude Code 设置。用户或项目设置里的 `disableAllHooks` 会让它失效。
+- token 文件必须对 MCP bridge 可读，所以同账户的任何进程都能读。token 只能申请操作和查询本任务状态，不能批准、不能取明文。
+- 会话记录 `~/.claude/projects/*.jsonl` 里有引用、operation_id 和操作结果，没有凭据。
+
+所以 hook 的作用是拦住模型的直接读取和常见变形，包括被提示注入后顺手去读文件的情况。它不能对付有意绕过的攻击者。本产品不提供沙盒，这条保证不在范围内。
+
+审批、过滤和身份判定仍然不放在 hook 里：项目级 hook 来自工作区内容，不可信。
 
 ## 未覆盖
 

@@ -7,7 +7,7 @@ import threading
 
 from .broker import GuardError
 from .crypto import canonical
-from .server import make_server, make_unix_server
+from .server import make_server
 
 MAX_REQUEST = 128 * 1024  # Room for one sealed credential of seal.MAX_PLAINTEXT bytes.
 
@@ -94,7 +94,7 @@ def serve_relay(relay, host="127.0.0.1", port=8780, cert=None, key=None, bind=No
         server.server_close()
 
 
-def serve_injector(injector, host="127.0.0.1", agent_port=8765, agent_socket=None, interval=1.0):
+def serve_injector(injector, host="127.0.0.1", agent_port=8765, interval=1.0):
     # One injector daemon per state directory; a second would re-run recovery.
     import fcntl
     lock = (injector.state / "server.lock").open("a")
@@ -103,20 +103,24 @@ def serve_injector(injector, host="127.0.0.1", agent_port=8765, agent_socket=Non
     except OSError:
         raise GuardError("injector_already_running") from None
     # The agent listener is the unchanged v0.1 agent API: reference, workflow, status.
-    agent = make_unix_server(injector, agent_socket) if agent_socket else make_server(injector, "agent", host, agent_port)
+    agent = make_server(injector, "agent", host, agent_port)
     injector.recover()
     stop = threading.Event()
 
     def worker():
+        tick = 0
         while not stop.wait(interval):
             try:
+                if tick % 5 == 0:
+                    injector.sync_rules()  # Protection rules set on the approver, for the agent hook.
+                tick += 1
                 injector.run_ready()
             except Exception:
                 pass  # Fail closed; no values or exception messages logged.
     threading.Thread(target=worker, daemon=True).start()
     # An automatic rejection usually arrives within a second; let the agent's call see it.
     injector.settle_seconds = 2.0
-    print(f"Agent: unix://{agent_socket}" if agent_socket else f"Agent: http://{host}:{agent_port}", flush=True)
+    print(f"Agent: http://{host}:{agent_port}", flush=True)
     try:
         agent.serve_forever()
     finally:

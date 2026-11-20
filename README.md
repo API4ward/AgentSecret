@@ -51,6 +51,21 @@ agent API 在 `http://127.0.0.1:8765`，审批页面在 `http://127.0.0.1:8766`�
 
 **手机远程访问**需要可信 HTTPS origin。`serve --host guard.example.com --cert /path/cert.pem --key /path/key.pem` 要求该域名解析为宿主绑定地址，访问 `https://guard.example.com:8766`；默认无 TLS 时拒绝非 loopback 绑定。agent 端口也会绑定该地址，部署时应由网络规则仅允许可信 worker 访问 agent 端口。此原型没有推送、原生 App、passkey、生物识别验证或反向代理适配。浏览器设备密钥证明持有密钥，不能证明每次签名都经过硬件用户验证。
 
+## 两层保护
+
+2026-11-20 起的产品方向：不提供沙盒。MCP 在 agent 主动要求使用密码时启用；hook 是底层防线，agent 用自带工具读取用户在审批端标记为受保护的内容时，自动触发审批。拆分部署下的用法见 [docs/split-architecture.md](docs/split-architecture.md) 的“两条路”一节。下面是 v0.1 单进程 broker 的说明。
+
+1. **第 1 层：阻止 agent 读取本地密码。** agent 自带的文件和 shell 工具不能打开 broker 状态目录、vault 密钥、task token。Claude Code 用 PreToolUse hook 实现，Codex 用它的 OS 沙箱读取禁令加同一个 hook 实现。本产品不提供沙盒或 OS 隔离：hook 是底层防线，拦的是经过 agent 工具调用的读取。
+2. **第 2 层：通过 MCP 服务让 agent 使用密码。** agent 只拿到任务 token 和不透明引用，broker 在审批通过后代为发出请求并注入真实凭据，明文不进入 agent。
+
+`claude-config --settings-out` 和 `codex-config` 一次生成两层所需的配置。
+
+| | 第 1 层的机制 | 强度 |
+|---|---|---|
+| Claude Code | PreToolUse hook（工具参数检查）加 `permissions.deny` | 拦住直接读取和常见变形；运行时拼出的路径拦不住 |
+| Codex | 沙箱权限配置（内核强制）加 PreToolUse hook | shell 命令无论怎么写都读不到；用户批准脱离沙箱的命令除外 |
+| 隔离部署（可选） | agent 在独立容器内，未挂载 broker 状态 | OS 边界 |
+
 ## 为一次任务建立 MCP 连接
 
 每个 broker task 单独生成 token 文件；该 token 只能申请操作，不能批准或读取明文。身份来自可信 CLI，模型不能通过提交 user/project/task_id 改变身份。
@@ -60,14 +75,15 @@ agent API 在 `http://127.0.0.1:8765`，审批页面在 `http://127.0.0.1:8766`�
   --token-file /absolute/path/run-01.token
 ```
 
-在该次独立 Codex 运行的专用配置中填入如下内容。路径必须为绝对路径。不要把 broker 的 vault、状态目录或审批浏览器 profile 挂载给 worker。
+用 `codex-config` 为这一次运行生成启动脚本，然后用它代替 `codex` 命令。它同时装好两层保护，不修改你的全局 Codex 配置：
 
-```toml
-[mcp_servers.secret_guard]
-command = "/absolute/path/AgentSecurity/.venv/bin/python"
-args = ["-m", "secret_guard.cli", "mcp", "--token-file", "/absolute/path/run-01.token"]
-cwd = "/absolute/path/AgentSecurity"
+```sh
+.venv/bin/secret-guard codex-config \
+  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.codex
+/absolute/path/run-01.codex            # 交互模式；也可接 exec "任务描述" 等参数
 ```
+
+脚本通过 `-c` 传入三项配置：`secret_guard` MCP 服务器；一个禁止读取 broker 状态目录、token 文件和 `secret_guard` 包目录的沙箱权限配置；一个 PreToolUse hook。不要再加 `-s danger-full-access` 或 `--dangerously-bypass-approvals-and-sandbox`，那会关掉沙箱。详见 [Codex 接入](docs/codex.md)。
 
 Codex 官方支持 [STDIO MCP 配置](https://learn.chatgpt.com/docs/extend/mcp)。本仓库提供协议实现和接入示例，未修改你的全局 Codex 配置。不要将同一配置/token 用于多个 Codex 任务。此兼容版的身份粒度是**独立 MCP 进程的 broker task**，无法认证官方客户端内部 thread/fork/subagent 身份；同一进程内创建新任务、fork 或子 agent 的独立权限隔离仍待运行时适配。因此它不能用共享全局 MCP 配置兑现逐原生任务隔离承诺。
 
@@ -96,23 +112,13 @@ Claude Code 使用同一个 MCP bridge。每次运行单独建 task，并用 `cl
 .venv/bin/secret-guard task-create --user alice --project payments \
   --agent claude-code --token-file /absolute/path/run-01.token
 .venv/bin/secret-guard claude-config \
-  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.mcp.json
-claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config
+  --token-file /absolute/path/run-01.token --out /absolute/path/run-01.mcp.json \
+  --settings-out /absolute/path/run-01.settings.json
+claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config \
+  --settings /absolute/path/run-01.settings.json
 ```
 
-不要用 `claude mcp add` 或仓库 `.mcp.json` 做全局登记。Claude Code 中工具名为 `mcp__secret_guard__guard_request_reference` 等。子 agent 与父会话共用同一个 task 身份，权限规则和 hooks 不构成安全边界。已用 Claude Code 2.1.311 和假凭据跑通闭环，详见 [Claude Code 接入与保证范围](docs/claude-code.md)。
-
-## 可选：隔离部署（broker 与 agent 分属不同容器）
-
-隔离部署是可选模式，不需要 Docker 也能按上面的本机流程使用全部功能，默认行为没有变化。区别在于保证范围：本机流程中 broker 和 agent 同属一个用户，agent 可以直接读 vault。需要这条边界时，改用 `isolation/` 下的容器部署：broker 独占状态卷，每个任务的 agent 运行在无网络、非 root、只读根文件系统的 worker 容器里，只能通过一个 Unix socket 调用 agent API。
-
-```sh
-isolation/guardctl up
-isolation/guardctl broker secret-add github-ci --user alice --project payments --repo acme/payments
-isolation/guardctl run --user alice --project payments --workspace /absolute/path/project -- <agent 命令>
-```
-
-worker 内的 MCP 命令为 `python -m secret_guard.cli mcp --url "$SECRET_GUARD_URL" --token-file "$SECRET_GUARD_TOKEN_FILE"`。结构、出网白名单、绕过测试结果和不在保证范围内的事项见 [OS 隔离部署](docs/isolation.md)。
+不要用 `claude mcp add` 或仓库 `.mcp.json` 做全局登记。Claude Code 中工具名为 `mcp__secret_guard__guard_request_reference` 等。`--settings-out` 生成的设置文件带有 PreToolUse hook，阻止 Claude 用 Read、Grep、Bash 等自带工具读取 broker 状态目录、token 文件和可信 CLI；MCP 只是调用通道，防读取靠这个 hook。token 和状态目录要放在工作区之外。hook 是同账户下的字符串检查，挡不住运行时拼出的路径，这条保证需要隔离部署。子 agent 与父会话共用同一个 task 身份。已用 Claude Code 2.1.311 和假凭据跑通闭环，详见 [Claude Code 接入与保证范围](docs/claude-code.md)。
 
 ## 撤销与审计
 
@@ -130,4 +136,4 @@ worker 内的 MCP 命令为 `python -m secret_guard.cli mcp --url "$SECRET_GUARD
 
 已实现受支持 broker 路径中的凭据代理与精确操作授权；结果整体缓冲、校验后才返回。对登记值和常见 base64/hex/URL 编码进行泄漏检查，再通过极小结果 schema；这不构成任意编码检测保证。
 
-**尚未实现严格版**：清洗工作区、输入/附件/原生工具输出过滤、Codex 内核及持久化/压缩/fork 适配。worker/broker OS 隔离与受控出网仅在[隔离部署](docs/isolation.md)下成立；不使用隔离部署时，相同用户权限的 agent 仍可能读取 broker 文件或审批浏览器状态，不能声称“所有消息永不泄漏”或抵御已控制宿主/审批设备的攻击者。请以假凭据验证此原型；真实部署必须先建立设计文档规定的安全域。详见 [实现状态](docs/implementation.md)。
+**尚未实现严格版**：清洗工作区、输入/附件/原生工具输出过滤、Codex 内核及持久化/压缩/fork 适配。本产品不提供 worker/broker OS 隔离或受控出网（隔离部署已于 2026-11-20 移除）；相同用户权限的 agent 仍可能读取 broker 文件或审批浏览器状态，不能声称“所有消息永不泄漏”或抵御已控制宿主/审批设备的攻击者。请以假凭据验证此原型；真实部署必须先建立设计文档规定的安全域。详见 [实现状态](docs/implementation.md)。

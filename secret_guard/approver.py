@@ -26,6 +26,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS secrets(alias TEXT PRIMARY KEY, version INTEGER, ciphertext BLOB, policy TEXT, active INTEGER);
 CREATE TABLE IF NOT EXISTS injectors(id TEXT PRIMARY KEY, jwk TEXT, enc_jwk TEXT, active INTEGER);
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, event TEXT, request_id TEXT);
+CREATE TABLE IF NOT EXISTS rules(kind TEXT, value TEXT, PRIMARY KEY(kind, value));
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER);
 """
 
 
@@ -105,6 +107,33 @@ class Approver:
             db.execute("INSERT OR REPLACE INTO secrets VALUES(?,?,?,?,1)", (alias, version, ciphertext, canonical({"repos": normalized})))
             self.audit(db, "secret_updated")
 
+    # Protection rules: what the agent's own tools may not read without an approval from here.
+    def list_rules(self):
+        with self.tx() as db:
+            return [{"kind": r["kind"], "value": r["value"]} for r in db.execute("SELECT * FROM rules ORDER BY kind, value")]
+
+    def set_rule(self, kind, value, present=True):
+        rule = {"kind": kind, "value": value.strip() if isinstance(value, str) else value}
+        if not protocol.valid_rule(rule):
+            raise GuardError("rule_invalid")
+        with self.tx() as db:
+            if present:
+                db.execute("INSERT OR IGNORE INTO rules VALUES(?,?)", (rule["kind"], rule["value"]))
+            elif not db.execute("DELETE FROM rules WHERE kind=? AND value=?", (rule["kind"], rule["value"])).rowcount:
+                raise GuardError("rule_unknown")
+            self.audit(db, "rule_added" if present else "rule_removed")
+        return rule
+
+    def publish_rules(self):
+        """Sign the whole rule set and hand it to the relay for this user's injectors."""
+        with self.tx() as db:
+            rules = [{"kind": r["kind"], "value": r["value"]} for r in db.execute("SELECT * FROM rules ORDER BY kind, value")]
+            last = db.execute("SELECT value FROM meta WHERE key='rules_version'").fetchone()
+            version = max(int(self.clock() * 1000), (last[0] if last else 0) + 1)
+            db.execute("INSERT OR REPLACE INTO meta VALUES('rules_version',?)", (version,))
+        text = canonical({"approver": self.device, "version": version, "rules": rules})
+        return self.link.request("/approver/rules", {"rules_text": text, "signature": sign(self.signing, protocol.rules_message(text))})
+
     def revoke(self, kind, identity):
         with self.tx() as db:
             if kind == "secret":
@@ -134,6 +163,17 @@ class Approver:
             return payload, injector, "request_invalid"
         if payload["expires_at"] <= self.clock():
             return payload, injector, "expired"
+        if payload.get("kind") == "access":
+            # A read of protected content carries no credential; the rule it names must be one of ours.
+            d = payload.get("details")
+            try:
+                if d != protocol.access_details(d["tool"], d["rule"], d["summary"], d["call"]) or not protocol.valid_rule(d["rule"]) \
+                        or not all(isinstance(d[k], str) for k in ("tool", "summary", "call")):
+                    return payload, injector, "request_invalid"
+            except Exception:
+                return payload, injector, "request_invalid"
+            known = db.execute("SELECT 1 FROM rules WHERE kind=? AND value=?", (d["rule"]["kind"], d["rule"]["value"])).fetchone()
+            return payload, injector, None if known else "rule_unknown"
         secret = db.execute("SELECT * FROM secrets WHERE alias=? AND active=1", (payload.get("secret_id"),)).fetchone()
         if not secret:
             return payload, injector, "secret_unavailable"
