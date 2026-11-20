@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, task TEXT, alias TEXT, 
 CREATE TABLE IF NOT EXISTS refs(id TEXT PRIMARY KEY, task TEXT, alias TEXT, approver TEXT, expires REAL, active INTEGER);
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, event TEXT, request_id TEXT, task TEXT);
 """
+MIGRATIONS = ["ALTER TABLE requests ADD COLUMN reason TEXT", "ALTER TABLE refs ADD COLUMN type TEXT", "ALTER TABLE refs ADD COLUMN used INTEGER DEFAULT 0"]
 ALIAS = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
@@ -59,8 +60,15 @@ class Injector:
         self.clock = clock
         self.transport = transport or adapter.fetch
         self.lock = threading.RLock()
+        self.running = threading.Lock()
+        self.settle_seconds = 0
         with self.tx() as db:
             db.executescript(SCHEMA)
+            for statement in MIGRATIONS:
+                try:
+                    db.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
         os.chmod(self.db, 0o600)
 
     @contextmanager
@@ -143,13 +151,17 @@ class Injector:
             raise GuardError("reference_invalid")
         return row
 
-    def create_request(self, db, task, alias, kind, details, ref=None):
-        # A denial stays sticky for the identical request within a task.
+    def create_request(self, db, task, alias, kind, details, ref=None, once=False):
+        # A person's denial stays sticky for the identical request within a task. An automatic
+        # rejection does not: its cause (a missing credential, a pairing) can be fixed and retried.
         for row in db.execute("SELECT * FROM requests WHERE task=? AND alias=? AND kind=?", (task["id"], alias, kind)):
             p = json.loads(row["request_text"])
             if p["details"] == details and row["ref"] == (ref if kind == "use" else row["ref"]):
-                if row["state"] == "denied" or (row["state"] == "pending" and p["expires_at"] > self.clock()):
+                sticky = row["state"] == "denied" and row["reason"] in (None, "user_denied")
+                if sticky or (row["state"] == "pending" and p["expires_at"] > self.clock()):
                     return self.safe(db, row)
+        if once and db.execute("SELECT used FROM refs WHERE id=?", (ref,)).fetchone()[0]:
+            raise GuardError("reference_used")
         if db.execute("SELECT count(*) FROM requests WHERE task=? AND state='pending'", (task["id"],)).fetchone()[0] >= 20:
             raise GuardError("too_many_pending_requests")
         preview = {"kind": kind, "project": task["project"], "task": task["id"], "credential": alias, "details": details}
@@ -162,22 +174,35 @@ class Injector:
         request_id = json.loads(request_text)["request_id"]
         # Nothing is recorded as pending unless the relay accepted the signed request.
         self.link.request("/injector/submit", {"request_text": request_text, "signature": sign(self.signing, protocol.request_message(request_text))})
-        db.execute("INSERT INTO requests VALUES(?,?,?,?,?,'pending',?,NULL)", (request_id, task["id"], alias, kind, request_text, ref))
+        db.execute("INSERT INTO requests VALUES(?,?,?,?,?,'pending',?,NULL,NULL)", (request_id, task["id"], alias, kind, request_text, ref))
+        if once:
+            db.execute("UPDATE refs SET used=1 WHERE id=?", (ref,))
         self.audit(db, "requested", request_id, task["id"])
         return {"operation_id": request_id, "state": "pending"}
 
-    def reference(self, token, alias):
-        if not isinstance(alias, str) or not ALIAS.fullmatch(alias):
+    def reference(self, token, alias, type="once"):
+        if not isinstance(alias, str) or not ALIAS.fullmatch(alias) or type not in protocol.REF_TYPES:
             raise GuardError("arguments_invalid")
         with self.tx() as db:
             task = self.task(db, token)
-            for row in db.execute("SELECT * FROM refs WHERE task=? AND alias=? AND active=1 AND expires>?", (task["id"], alias, self.clock())).fetchall():
+            for row in db.execute("SELECT * FROM refs WHERE task=? AND alias=? AND type=? AND used=0 AND active=1 AND expires>?", (task["id"], alias, type, self.clock())).fetchall():
                 try:
                     self.valid_ref(db, task, row["id"])
-                    return {"state": "approved", "ref": row["id"], "expires_at": row["expires"]}
+                    return {"state": "approved", "ref": row["id"], "type": type, "expires_at": row["expires"]}
                 except GuardError:
                     pass
-            return self.create_request(db, task, alias, "reference", {"scope": "task_reference_only", "ttl_seconds": protocol.REF_TTL})
+            out = self.create_request(db, task, alias, "reference", protocol.reference_details(type))
+        return self.settle(token, out)
+
+    def settle(self, token, out):
+        """Give a just-submitted request a moment to be rejected automatically, so the
+        caller sees the reason in this answer instead of a bare pending."""
+        deadline = time.monotonic() + self.settle_seconds
+        while out.get("state") == "pending" and time.monotonic() < deadline:
+            time.sleep(0.2)
+            self.run_ready(out["operation_id"])
+            out = self.status(token, out["operation_id"])
+        return out
 
     def workflow(self, token, ref, repo, limit=10):
         try:
@@ -187,7 +212,8 @@ class Injector:
         with self.tx() as db:
             task = self.task(db, token)
             row = self.valid_ref(db, task, ref)
-            return self.create_request(db, task, row["alias"], "use", details, ref)
+            out = self.create_request(db, task, row["alias"], "use", details, ref, row["type"] == "once")
+        return self.settle(token, out)
 
     def safe(self, db, row):
         state = row["state"]
@@ -195,11 +221,16 @@ class Injector:
             state = "expired"
             db.execute("UPDATE requests SET state='expired' WHERE id=?", (row["id"],))
         out = {"operation_id": row["id"], "state": state}
+        reason = "no_response" if state == "expired" else row["reason"]
+        if reason:
+            out.update(reason=reason, message=protocol.explain(reason))
         if row["kind"] == "reference" and state == "approved":
             task = db.execute("SELECT * FROM tasks WHERE id=?", (row["task"],)).fetchone()
             try:
                 ref = self.valid_ref(db, task, row["ref"], row["alias"])
-                out.update(ref=ref["id"], expires_at=ref["expires"])
+                out.update(ref=ref["id"], type=ref["type"], expires_at=ref["expires"])
+                if ref["type"] == "once":
+                    out["uses_left"] = 0 if ref["used"] else 1
             except GuardError:
                 out["state"] = "revoked"
         if state == "succeeded":
@@ -228,9 +259,29 @@ class Injector:
             raise GuardError("device_unauthorized")
         verify(json.loads(row["jwk"]), protocol.decision_message("approve", device, request_text), signature)
 
-    def run_ready(self):
+    def denial(self, db, row, answer):
+        """Reason for a denial, believed only when signed by a paired approver."""
+        approver, reason = answer.get("approver"), answer.get("reason") or ""
+        if reason and reason not in protocol.REASONS:
+            return None
+        paired = db.execute("SELECT * FROM approvers WHERE id=? AND active=1", (approver,)).fetchone()
+        if not paired:
+            return "approver_not_paired" if approver else None
+        try:
+            verify(json.loads(paired["jwk"]), protocol.decision_message("deny", approver, row["request_text"], reason), answer.get("signature"))
+        except Exception:
+            return None
+        return reason or "user_denied"
+
+    def run_ready(self, only=None):
+        # One collector at a time: a sealed credential is delivered once, to one reader.
+        with self.running:
+            self.collect(only)
+
+    def collect(self, only):
         with self.tx() as db:
-            rows = [r for r in db.execute("SELECT * FROM requests WHERE state='pending'").fetchall() if self.safe(db, r)["state"] == "pending"]
+            rows = [r for r in db.execute("SELECT * FROM requests WHERE state='pending'").fetchall()
+                    if only in (None, r["id"]) and self.safe(db, r)["state"] == "pending"]
         for row in rows:
             try:
                 answer = self.link.request("/injector/poll", {"request_id": row["id"]})
@@ -246,7 +297,8 @@ class Injector:
             else:
                 with self.tx() as db:
                     final = state if state in {"denied", "expired"} else "revoked"
-                    db.execute("UPDATE requests SET state=? WHERE id=? AND state='pending'", (final, row["id"]))
+                    reason = self.denial(db, row, answer) if final == "denied" else None
+                    db.execute("UPDATE requests SET state=?,reason=? WHERE id=? AND state='pending'", (final, reason, row["id"]))
                     self.audit(db, final, row["id"], row["task"])
 
     def grant_reference(self, request_id, answer):
@@ -259,12 +311,16 @@ class Injector:
                 self.approver_key(db, answer["approver"], row["request_text"], answer["signature"])
                 if not task or json.loads(row["request_text"])["expires_at"] <= self.clock():
                     raise GuardError("expired")
-            except Exception:
-                db.execute("UPDATE requests SET state='revoked' WHERE id=?", (request_id,))
+                kind = json.loads(row["request_text"])["details"]["type"]
+                if kind not in protocol.REF_TYPES:
+                    raise GuardError("request_invalid")
+            except Exception as exc:
+                db.execute("UPDATE requests SET state='revoked',reason=? WHERE id=?", ("approver_not_paired" if str(exc) == "device_unauthorized" else None, request_id))
                 self.audit(db, "approval_rejected", request_id, row["task"])
                 return False
             ref = opaque("secretref://r_")
-            db.execute("INSERT INTO refs VALUES(?,?,?,?,?,1)", (ref, task["id"], row["alias"], answer["approver"], min(self.clock() + protocol.REF_TTL, task["expires"])))
+            # The expiry is fixed here, when the approval arrives, and reported in status.
+            db.execute("INSERT INTO refs VALUES(?,?,?,?,?,1,?,0)", (ref, task["id"], row["alias"], answer["approver"], min(self.clock() + protocol.REF_TTL, task["expires"]), kind))
             db.execute("UPDATE requests SET state='approved',ref=? WHERE id=?", (ref, request_id))
             self.audit(db, "approved", request_id, task["id"])
         return True
@@ -285,8 +341,8 @@ class Injector:
                     raise GuardError("request_changed")
                 # Opens only if sealed to this injector for exactly this request.
                 token = unseal(self.sealing, answer["sealed"], protocol.seal_aad(row["request_text"])).decode()
-            except Exception:
-                db.execute("UPDATE requests SET state='revoked' WHERE id=?", (request_id,))
+            except Exception as exc:
+                db.execute("UPDATE requests SET state='revoked',reason=? WHERE id=?", ("approver_not_paired" if str(exc) == "device_unauthorized" else None, request_id))
                 self.audit(db, "execution_blocked", request_id, row["task"])
                 blocked = True
             else:

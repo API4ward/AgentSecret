@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from .crypto import b64, public_key, unb64
 
 INFO = b"secret-guard/seal/v1"
-MAX_PLAINTEXT = 4096
+MAX_PLAINTEXT = 64 * 1024
 
 
 def load_or_create_key(path):
@@ -84,4 +84,4 @@ def unseal(private, box, aad):
 def valid_box(box):
     """Shape check the relay can do without being able to open the box."""
     return (isinstance(box, dict) and set(box) == {"epk", "nonce", "ct"}
-            and all(isinstance(v, str) and 0 < len(v) <= 8192 for v in box.values()))
+            and all(isinstance(v, str) and 0 < len(v) <= 90000 for v in box.values()))

@@ -14,6 +14,8 @@ from pathlib import Path
 import sys
 import time
 
+from . import protocol
+
 BASE = Path.home() / ".local/share/agentsecret"
 
 
@@ -102,7 +104,8 @@ def describe(payload):
         d = payload["details"]
         lines.append(f"  操作 {d['method']} https://{d['host']}{d['path']}?{d['query']}")
     else:
-        lines.append("  操作 允许本任务引用该凭据；每次使用仍需单独批准")
+        once = payload["details"]["type"] == "once"
+        lines.append("  操作 允许本任务引用该凭据（" + ("一次性：只能发起一次使用申请" if once else "长期：批准后 1 小时内可反复申请使用") + "）；每次使用仍需单独批准")
     lines.append(f"  注入工具 {payload['injector']} · 有效至 {time.strftime('%H:%M:%S', time.localtime(payload['expires_at']))}")
     return "\n".join(lines)
 
@@ -118,9 +121,8 @@ def approve_loop(approver):
             payload = item["payload"]
             print("\n" + ("允许这一次具体使用？" if payload.get("kind") == "use" else "允许任务引用凭据？"))
             if item["problem"]:
-                # Rules come before the prompt: a forbidden request is denied, never offered.
-                print(f"  已自动拒绝：{item['problem']}")
-                approver.decide(item, "deny")
+                # Rules come before the prompt: a forbidden request is rejected with its reason, never offered.
+                print(f"  {'已自动拒绝并告知调用方' if item['rejected'] else '不能批准'}：{protocol.explain(item['problem'])}")
                 continue
             print(describe(payload))
             answer = input("  批准输入 yes，其余任意输入为拒绝: ").strip()
@@ -196,7 +198,7 @@ def main():
                 approver.pair_injector(d["device"], d["user"], d["jwk"], d["enc_jwk"])
                 print("Injector paired. Credentials are sealed to this injector only.")
             elif args.command == "secret-add":
-                approver.add_secret(args.alias, getpass.getpass("Credential (hidden): "), args.repo)
+                approver.add_secret(args.alias, getpass.getpass("密码（不回显；内容由你管理，按原样保存）: "), args.repo)
                 print("Credential stored on this approver.")
             elif args.command == "run":
                 approve_loop(approver)
@@ -208,7 +210,7 @@ def main():
     except KeyboardInterrupt:
         pass
     except GuardError as exc:
-        print(str(exc), file=sys.stderr)
+        print(protocol.ERRORS.get(str(exc), str(exc)), file=sys.stderr)
         sys.exit(1)
     except Exception:
         print("Trusted command failed; check inputs and permissions.", file=sys.stderr)

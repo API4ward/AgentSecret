@@ -54,8 +54,8 @@ class SplitTests(unittest.TestCase):
         item = next(p for p in self.app.pending() if p["request_id"] == op)
         return self.app.decide(item, decision)
 
-    def ref(self):
-        op = self.inj.reference(self.t, "github")["operation_id"]
+    def ref(self, kind="long"):
+        op = self.inj.reference(self.t, "github", kind)["operation_id"]
         self.decide(op)
         self.inj.run_ready()
         return self.inj.status(self.t, op)["ref"]
@@ -116,7 +116,7 @@ class SplitTests(unittest.TestCase):
         self.inj.run_ready()
         self.assertEqual(self.state(first), "succeeded")
         self.now += 1
-        second = self.inj.workflow(self.t, self.inj.reference(self.t, "github")["ref"], "acme/payments", 5)["operation_id"]
+        second = self.inj.workflow(self.t, self.inj.reference(self.t, "github", "long")["ref"], "acme/payments", 5)["operation_id"]
         self.decide(second)
         self.inj.run_ready()  # Relay replays the first box for the second request.
         self.assertEqual(self.state(second), "revoked")
@@ -148,7 +148,7 @@ class SplitTests(unittest.TestCase):
         self.decide(op, "deny")
         self.inj.run_ready()
         self.assertEqual(self.state(op), "denied")
-        self.assertEqual(self.inj.workflow(self.t, ref, "acme/payments"), {"operation_id": op, "state": "denied"})
+        self.assertEqual(self.inj.workflow(self.t, ref, "acme/payments"), {"operation_id": op, "state": "denied", "reason": "user_denied", "message": "用户拒绝了这次请求"})
         late = self.inj.workflow(self.t, ref, "acme/payments", 3)["operation_id"]
         self.now += protocol.USE_TTL + 1
         self.assertEqual(self.app.pending(), [])
@@ -184,6 +184,108 @@ class SplitTests(unittest.TestCase):
             text = db.execute("SELECT request_text FROM requests WHERE id=?", (op,)).fetchone()[0]
             db.execute("UPDATE requests SET request_text=? WHERE id=?", (text.replace("acme/payments", "acme/paymentz"), op))
         self.assertEqual(next(p for p in self.app.pending() if p["request_id"] == op)["problem"], "signature_invalid")
+
+    def test_caller_is_told_why_a_request_cannot_be_approved(self):
+        op = self.inj.reference(self.t, "missing")["operation_id"]
+        item = next(p for p in self.app.pending() if p["request_id"] == op)
+        self.assertTrue(item["rejected"])  # No person involved.
+        self.assertEqual(self.app.pending(), [])
+        self.inj.run_ready()
+        self.assertEqual(self.inj.status(self.t, op), {"operation_id": op, "state": "denied", "reason": "secret_unavailable", "message": "本设备没有这个密码"})
+        # Not sticky: once the credential exists the same call starts a fresh request.
+        self.app.add_secret("missing", "x", ["acme/payments"])
+        self.assertEqual(self.inj.reference(self.t, "missing")["state"], "pending")
+        use = self.inj.workflow(self.t, self.ref(), "acme/elsewhere")["operation_id"]
+        self.app.pending()
+        self.inj.run_ready()
+        self.assertEqual(self.inj.status(self.t, use)["reason"], "policy_denied")
+        late = self.inj.reference(self.t, "github", "once")["operation_id"]
+        self.now += protocol.USE_TTL + 1
+        self.assertEqual(self.inj.status(self.t, late)["reason"], "no_response")
+
+    def test_the_agent_call_itself_returns_the_reason(self):
+        self.inj.settle_seconds = 5
+        stop = threading.Event()
+
+        def approver():
+            while not stop.wait(0.05):
+                self.app.pending()
+        threading.Thread(target=approver, daemon=True).start()
+        try:
+            out = self.inj.reference(self.t, "missing")
+        finally:
+            stop.set()
+        self.assertEqual((out["state"], out["reason"]), ("denied", "secret_unavailable"))
+
+    def test_relay_cannot_invent_a_reason_and_another_approver_may_still_approve(self):
+        op = self.inj.reference(self.t, "missing")["operation_id"]
+        real = self.relay.dispatch
+        self.inj.link.call = lambda route, body, token=None: dict(real(route, body, token), state="denied", reason="policy_denied") if route == "/injector/poll" else real(route, body, token)
+        self.inj.run_ready()
+        self.assertEqual(self.inj.status(self.t, op), {"operation_id": op, "state": "denied"})
+        self.inj.link.call = real
+        # A second approver of the same user holds the credential the first one lacks.
+        second = Approver(self.root / "approver2", call=self.call, clock=lambda: self.now, user="alice")
+        i, a = self.inj.pairing(), second.pairing()
+        self.relay.register_device(a["device"], "alice", "approver", a["jwk"])
+        self.inj.pair_approver(a["device"], "alice", a["jwk"])
+        second.pair_injector(i["device"], "alice", i["jwk"], i["enc_jwk"])
+        second.add_secret("elsewhere", "pw", ["acme/payments"])
+        op = self.inj.reference(self.t, "elsewhere")["operation_id"]
+        self.assertTrue(next(p for p in self.app.pending() if p["request_id"] == op)["rejected"])
+        self.inj.run_ready()
+        self.assertEqual(self.state(op), "pending")
+        second.decide(next(p for p in second.pending() if p["request_id"] == op), "approve")
+        self.inj.run_ready()
+        self.assertEqual(self.state(op), "approved")
+
+    def test_reference_types(self):
+        op = self.inj.reference(self.t, "github")["operation_id"]  # Default: once.
+        self.decide(op)
+        self.now += 30
+        self.inj.run_ready()
+        status = self.inj.status(self.t, op)
+        self.assertEqual((status["type"], status["uses_left"], status["expires_at"]), ("once", 1, self.now + 3600))
+        first = self.inj.workflow(self.t, status["ref"], "acme/payments")
+        self.assertEqual(self.inj.workflow(self.t, status["ref"], "acme/payments"), first)  # Same pending request.
+        with self.assertRaisesRegex(GuardError, "reference_used"):
+            self.inj.workflow(self.t, status["ref"], "acme/payments", 3)
+        self.assertEqual(self.inj.status(self.t, op)["uses_left"], 0)
+        self.decide(first["operation_id"])
+        self.inj.run_ready()
+        self.assertEqual(self.state(first["operation_id"]), "succeeded")  # The one use still runs.
+        self.assertNotEqual(self.inj.reference(self.t, "github")["state"], "approved")  # A used reference is not handed out again.
+        ref = self.ref("long")
+        for limit in (1, 2):
+            use = self.inj.workflow(self.t, ref, "acme/payments", limit)["operation_id"]
+            self.decide(use)  # Every use is approved separately.
+            self.inj.run_ready()
+            self.assertEqual(self.state(use), "succeeded")
+        self.assertEqual(self.inj.reference(self.t, "github", "long")["ref"], ref)
+        self.now += 3601
+        with self.assertRaisesRegex(GuardError, "reference_invalid"):
+            self.inj.workflow(self.t, ref, "acme/payments", 4)
+        with self.assertRaisesRegex(GuardError, "arguments_invalid"):
+            self.inj.reference(self.t, "github", "forever")
+
+    def test_credential_is_stored_as_given(self):
+        for alias, value in [("short", "x"), ("spaces", "  two words \n"), ("unicode", "密码🔑"), ("long", "k" * 60000)]:
+            self.app.add_secret(alias, value, ["acme/payments"])
+            with self.app.tx() as db:
+                row = db.execute("SELECT * FROM secrets WHERE alias=?", (alias,)).fetchone()
+            blob = row["ciphertext"]
+            self.assertEqual(self.app.vault.decrypt(blob[:12], blob[12:], json.dumps([alias, 1], separators=(",", ":")).encode()).decode(), value)
+        for args, code in [(("bad alias", "x", ["acme/payments"]), "alias_invalid"), (("a", "", ["acme/payments"]), "secret_empty"),
+                           (("a", "x", ["nope"]), "repo_invalid"), (("a", "x", []), "empty_policy"), (("a", "x" * 70000, ["acme/payments"]), "secret_too_large")]:
+            with self.assertRaisesRegex(GuardError, code):
+                self.app.add_secret(*args)
+        # The largest credential still travels sealed through the relay to the injector.
+        ref = self.ref()
+        self.app.add_secret("github", "k" * 60000, ["acme/payments"])
+        op = self.inj.workflow(self.t, ref, "acme/payments")["operation_id"]
+        self.decide(op)
+        self.inj.run_ready()
+        self.assertEqual(self.calls[-1][1], "k" * 60000)
 
     def test_relay_surface(self):
         token = self.inj.link.token or self.login(self.inj.device, self.inj.signing)
@@ -229,7 +331,7 @@ class SplitTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             url = f"http://{server.expected_host}"
-            op = mcp.call(url, self.t, "guard.request_reference", {"alias": "github"})["operation_id"]
+            op = mcp.call(url, self.t, "guard.request_reference", {"alias": "github", "type": "long"})["operation_id"]
             self.decide(op)
             self.inj.run_ready()
             ref = mcp.call(url, self.t, "guard.operation_status", {"operation_id": op})["ref"]

@@ -7,7 +7,9 @@ import threading
 
 from .broker import GuardError
 from .crypto import canonical
-from .server import MAX_REQUEST, make_server, make_unix_server
+from .server import make_server, make_unix_server
+
+MAX_REQUEST = 128 * 1024  # Room for one sealed credential of seal.MAX_PLAINTEXT bytes.
 
 FILES = {"/": ("approver.html", "text/html; charset=utf-8"), "/approver.js": ("approver.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
 
@@ -112,6 +114,8 @@ def serve_injector(injector, host="127.0.0.1", agent_port=8765, agent_socket=Non
             except Exception:
                 pass  # Fail closed; no values or exception messages logged.
     threading.Thread(target=worker, daemon=True).start()
+    # An automatic rejection usually arrives within a second; let the agent's call see it.
+    injector.settle_seconds = 2.0
     print(f"Agent: unix://{agent_socket}" if agent_socket else f"Agent: http://{host}:{agent_port}", flush=True)
     try:
         agent.serve_forever()

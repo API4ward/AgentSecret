@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, user TEXT, injector TEX
     signature TEXT, state TEXT, approver TEXT, approval TEXT, sealed TEXT);
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, event TEXT, request_id TEXT, device TEXT);
 """
+# Columns added after the first prototype; applied to existing databases too.
+MIGRATIONS = ["ALTER TABLE requests ADD COLUMN reason TEXT", "ALTER TABLE requests ADD COLUMN declines TEXT"]
 IDENT = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 KINDS = {"approver", "injector"}
 REPORTS = {"executing", "succeeded", "unknown", "blocked"}
@@ -42,6 +44,11 @@ class Relay:
         self.lock = threading.RLock()
         with self.tx() as db:
             db.executescript(SCHEMA)
+            for statement in MIGRATIONS:
+                try:
+                    db.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
         os.chmod(self.db, 0o600)
 
     @contextmanager
@@ -170,7 +177,7 @@ class Relay:
             pending = [r for r in db.execute("SELECT * FROM requests WHERE injector=? AND state='pending'", (injector["id"],)).fetchall() if self.live(db, r) == "pending"]
             if len(pending) >= MAX_PENDING:
                 raise GuardError("too_many_pending_requests")
-            db.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,'pending',NULL,NULL,NULL)",
+            db.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,'pending',NULL,NULL,NULL,NULL,NULL)",
                        (request_id, injector["user"], injector["id"], kind, expires, request_text, signature))
             self.audit(db, "requested", request_id, injector["id"])
         return {"state": "pending"}
@@ -189,6 +196,9 @@ class Relay:
                     out["sealed"] = json.loads(row["sealed"])
                     db.execute("UPDATE requests SET state='delivered',sealed=NULL WHERE id=?", (request_id,))
                     self.audit(db, "delivered", request_id, injector["id"])
+            elif out["state"] == "denied":
+                # Signed by the approver, so the injector can show a reason the relay cannot invent.
+                out.update(approver=row["approver"], signature=row["approval"], reason=row["reason"] or "")
             return out
 
     def report(self, token, request_id, event):
@@ -207,10 +217,14 @@ class Relay:
         with self.tx() as db:
             approver = self.session(db, token, "approver")
             rows = db.execute("SELECT * FROM requests WHERE user=? AND state='pending' ORDER BY rowid", (approver["user"],)).fetchall()
-            return {"requests": [{"request_text": r["request_text"], "signature": r["signature"]} for r in rows if self.live(db, r) == "pending"]}
+            injectors = [r["id"] for r in db.execute("SELECT id FROM devices WHERE user=? AND kind='injector' AND active=1", (approver["user"],))]
+            return {"injectors": injectors, "requests": [
+                {"request_text": r["request_text"], "signature": r["signature"]} for r in rows
+                if self.live(db, r) == "pending" and approver["id"] not in json.loads(r["declines"] or "{}")]}
 
-    def decide(self, token, request_id, decision, signature, sealed=None):
-        if decision not in {"approve", "deny"}:
+    def decide(self, token, request_id, decision, signature, sealed=None, reason=""):
+        # A reason marks an automatic rejection: this approver cannot approve the request at all.
+        if decision not in {"approve", "deny"} or (reason and (decision != "deny" or reason not in protocol.REASONS)):
             raise GuardError("decision_invalid")
         with self.tx() as db:
             approver = self.session(db, token, "approver")
@@ -223,12 +237,21 @@ class Relay:
             if needs_box != (sealed is not None) or (needs_box and not valid_box(sealed)):
                 raise GuardError("decision_invalid")
             try:
-                verify(json.loads(approver["jwk"]), protocol.decision_message(decision, approver["id"], row["request_text"]), signature)
+                verify(json.loads(approver["jwk"]), protocol.decision_message(decision, approver["id"], row["request_text"], reason), signature)
             except Exception:
                 raise GuardError("signature_invalid") from None
+            if reason:
+                # Another approver of the same user may hold the credential; final only when none can.
+                declines = json.loads(row["declines"] or "{}")
+                declines[approver["id"]] = reason
+                db.execute("UPDATE requests SET declines=? WHERE id=?", (canonical(declines), request_id))
+                others = [r["id"] for r in db.execute("SELECT id FROM devices WHERE user=? AND kind='approver' AND active=1", (row["user"],)) if r["id"] not in declines]
+                if others:
+                    self.audit(db, "declined", request_id, approver["id"])
+                    return {"state": "pending"}
             state = "approved" if decision == "approve" else "denied"
-            db.execute("UPDATE requests SET state=?,approver=?,approval=?,sealed=? WHERE id=?",
-                       (state, approver["id"], signature, canonical(sealed) if sealed else None, request_id))
+            db.execute("UPDATE requests SET state=?,approver=?,approval=?,sealed=?,reason=? WHERE id=?",
+                       (state, approver["id"], signature, canonical(sealed) if sealed else None, reason or None, request_id))
             self.audit(db, state, request_id, approver["id"])
         return {"state": state}
 
@@ -247,7 +270,7 @@ class Relay:
         if route not in self.ROUTES or not isinstance(body, dict):
             raise GuardError("route_unavailable")
         name, fields, auth = self.ROUTES[route]
-        optional = {"sealed"} if name == "decide" else set()
+        optional = {"sealed", "reason"} if name == "decide" else set()
         if not fields <= set(body) or set(body) - fields - optional:
             raise GuardError("route_unavailable")
         if any(not isinstance(v, str) for k, v in body.items() if k != "sealed"):

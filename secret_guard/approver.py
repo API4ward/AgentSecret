@@ -20,7 +20,7 @@ from .broker import GuardError
 from .crypto import canonical, verify
 from .injector import ALIAS, load_config
 from .link import DeviceLink, http_call
-from .seal import clean_jwk, jwk, load_or_create_key, seal, sign
+from .seal import MAX_PLAINTEXT, clean_jwk, jwk, load_or_create_key, seal, sign
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS secrets(alias TEXT PRIMARY KEY, version INTEGER, ciphertext BLOB, policy TEXT, active INTEGER);
@@ -83,9 +83,18 @@ class Approver:
             self.audit(db, "injector_paired")
 
     def add_secret(self, alias, value, repos):
-        if not isinstance(alias, str) or not ALIAS.fullmatch(alias) or not value or not 8 <= len(value) <= 4096:
-            raise GuardError("invalid_secret")
-        normalized = sorted({adapter.normalize(repo, 1)["repo"] for repo in repos})
+        # The credential is the user's to manage: stored exactly as given, never inspected.
+        # The alias is what tells credentials apart, so only the alias has a format.
+        if not isinstance(alias, str) or not ALIAS.fullmatch(alias):
+            raise GuardError("alias_invalid")
+        if not isinstance(value, str) or not value:
+            raise GuardError("secret_empty")
+        if len(value.encode()) > MAX_PLAINTEXT:
+            raise GuardError("secret_too_large")
+        try:
+            normalized = sorted({adapter.normalize(repo, 1)["repo"] for repo in repos})
+        except Exception:
+            raise GuardError("repo_invalid") from None
         if not normalized:
             raise GuardError("empty_policy")
         with self.tx() as db:
@@ -137,12 +146,14 @@ class Approver:
                 return payload, injector, "request_changed"
             if payload["details"]["args"]["repo"] not in json.loads(secret["policy"])["repos"]:
                 return payload, injector, "policy_denied"
-        elif payload["kind"] != "reference":
+        elif payload["kind"] != "reference" or payload["details"].get("type") not in protocol.REF_TYPES \
+                or payload["details"] != protocol.reference_details(payload["details"]["type"]):
             return payload, injector, "request_invalid"
         return payload, injector, None
 
-    def pending(self):
-        """Requests waiting for this user, each with the problem that forbids approval, if any."""
+    def pending(self, reject=True):
+        """Requests waiting for this user. One this device can never approve is rejected at
+        once with its reason, so the caller is told why instead of waiting for a person."""
         entries = self.link.request("/approver/pending", {})["requests"]
         out = []
         with self.tx() as db:
@@ -151,7 +162,14 @@ class Approver:
                     payload, _, problem = self.check(db, entry)
                 except Exception:
                     continue  # Not even parseable: never shown, never signed.
-                out.append({"request_id": payload["request_id"], "payload": payload, "problem": problem, "entry": entry})
+                out.append({"request_id": payload["request_id"], "payload": payload, "problem": problem, "entry": entry, "rejected": False})
+        for item in out:
+            if reject and item["problem"] in protocol.REASONS:
+                try:
+                    self.decide(item, "deny")
+                    item["rejected"] = True
+                except GuardError:
+                    pass
         return out
 
     def decide(self, item, decision):
@@ -171,6 +189,9 @@ class Approver:
                     # Sealed to the key recorded at pairing, never to a key the relay supplies.
                     body["sealed"] = seal(json.loads(injector["enc_jwk"]), value, protocol.seal_aad(text))
                     value = None
-            body["signature"] = sign(self.signing, protocol.decision_message(decision, self.device, text))
+            reason = problem if decision == "deny" and problem in protocol.REASONS else ""
+            if reason:
+                body["reason"] = reason
+            body["signature"] = sign(self.signing, protocol.decision_message(decision, self.device, text, reason))
             self.audit(db, "approved" if decision == "approve" else "denied", item["request_id"])
         return self.link.request("/approver/decision", body)
