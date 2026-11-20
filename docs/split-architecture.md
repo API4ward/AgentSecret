@@ -56,53 +56,77 @@ agent 仍然通过原有的 MCP bridge（`secret-guard mcp`）连接，三个工
 
 审批端不解释也不限制密码内容：任意字符、任意长度按原样保存，只拒绝空值。唯一的上限是一次密封转发的 64 KB。别名（1 到 64 个字母、数字、点、下划线、连字符）用来区分每条密码，校验失败时分别提示是别名、密码还是仓库的问题。只读 GitHub adapter 发请求时仍要求 token 是可见 ASCII，这是 adapter 的限制，不符合时该次使用结果为 `unknown`。
 
-## 两条路：agent 主动申请，或读取时被拦下
+## agent 碰到密码的三种情况
 
-| | 什么时候启用 | 机制 |
+| 情况 | 谁发起 | 结果 |
 | --- | --- | --- |
-| MCP | agent 主动要求使用密码 | 上面的两阶段流程：引用，再逐次使用。密码由注入工具代为注入，明文不进入 agent。 |
-| hook | agent 用自带工具（读文件、搜索、shell）去读受保护内容 | 底层防线。hook 拦下这次工具调用，自动向审批端发起审批，用户批准后这一次调用才执行。 |
+| agent 主动要求使用密码 | agent 调用 MCP 工具 | 上面的两阶段流程，密码由注入工具代为注入，明文不进入 agent |
+| 工具返回的内容里有密码（`reveal`） | hook，在模型看到结果之前 | 触发审批。批准后，内容里的密码被换成引用 `{{secretref:别名}}` 再交给 agent；拒绝或无人应答则这段内容不给 agent |
+| 工具调用的参数里有引用（`fill`） | hook，在工具执行之前 | 触发审批。批准后，引用被换成密码，只出现在这一次工具调用的输入里 |
 
-本产品不提供沙盒或 OS 隔离。hook 匹配的是工具调用的文本，拦不住不经过 agent 工具的进程。
+本产品不提供沙盒或 OS 隔离。hook 管的是经过 agent 工具调用的内容。
 
-### 受保护内容在审批端设置
+### 审批端保存明文，agent 机器上只有匹配程序
 
-```sh
-agentsecret approver protect-add --path .env             # 文件名或通配，任何目录下都算
-agentsecret approver protect-add --path '~/.aws'         # 固定的文件或目录
-agentsecret approver protect-add --text GITHUB_TOKEN     # 不允许出现在工具调用里的字符串
-agentsecret approver protect-list
-agentsecret approver protect-remove --path .env
-```
+审批端把每条密码（含同名副本）编译成一个匹配器，对整套匹配器签名（`secret-guard/rules/v1:` + 文本，带递增版本号），经 server 下发。注入工具只接受已配对审批端签名的版本，版本号不能回退，每 5 秒同步一次。匹配器在 `secret_guard/matcher.py`（浏览器审批端用 WebCrypto 做同样的编译），每条包含：
 
-浏览器审批端在“受保护内容”一栏做同样的事。规则不是密码，只是“什么需要审批”。审批端对整套规则签名（`secret-guard/rules/v1:` + 规则文本，带递增版本号），经 server 下发；注入工具只接受已配对审批端签名的规则，版本号不能回退，所以 server 既编不出规则，也不能换回旧规则。注入工具每 5 秒同步一次。
+- 密码的字节长度；
+- 滚动哈希的 16 位标记，用来快速排除绝大多数位置；
+- 加盐的 PBKDF2-HMAC-SHA256 摘要（5 万次迭代），用来确认真正命中。
 
-### 给 agent 装上 hook
+匹配器里没有明文，也不能反解。但它本质上是一个“是不是这条密码”的判定器：能读到注入工具状态目录的人可以拿它离线试猜测。高熵的密码（API key）不受影响；像 `18year` 这样短而可猜的值，保护强度只有 PBKDF2 的计算成本，16 位标记还会再泄露 16 比特。少于 4 字节的密码不编译，也就检测不到。匹配只认原样的字节，base64、URL 编码、拆开写的密码检测不到。
+
+### hook 做什么
+
+`agentsecret injector claude-config`（Claude Code）和 `codex-config`（Codex）生成的配置在 PreToolUse 和 PostToolUse 两个事件上安装同一个 hook（`secret_guard/claude_hook.py`）。
 
 ```sh
 agentsecret injector claude-config --token-file /absolute/path/run-01.token \
   --out /absolute/path/run-01.mcp.json --settings-out /absolute/path/run-01.settings.json
 claude --mcp-config /absolute/path/run-01.mcp.json --strict-mcp-config --settings /absolute/path/run-01.settings.json
-
-agentsecret injector codex-config --token-file /absolute/path/run-01.token --out /absolute/path/run-01.codex
-/absolute/path/run-01.codex
 ```
 
-生成的 PreToolUse hook（`secret_guard/claude_hook.py`，Claude Code 与 Codex 共用）对每次工具调用做两件事：
+- **工具执行之后（PostToolUse）**：hook 把工具结果交给本机的注入工具扫描。没有命中就原样放行。命中则提交一次 `reveal` 请求，最多等 110 秒；批准后用 `updatedToolOutput` 把结果里的密码换成引用，否则把含密码的那段文字换成一句“已扣留”的说明。注入工具不可达时同样扣留。
+- **工具执行之前（PreToolUse）**：调用碰到 AgentSecret 自己的状态时直接拒绝。参数里有 `{{secretref:别名}}` 时提交一次 `fill` 请求；批准后审批端把值密封给注入工具，hook 取走一次，用 `updatedInput` 换进参数。值只在注入工具和 hook 的内存里经过，不写盘。拒绝或超时则拦下这次调用。
 
-1. 调用碰到 AgentSecret 自己的状态（注入工具状态目录、token 文件、配置文件、可信 CLI）时直接拒绝，不提供审批。
-2. 否则向注入工具取当前规则。命中规则时，把工具名、命中的规则和调用摘要（最多 300 字符）作为一次 `access` 请求签名提交，审批端出现“agent 要读取受保护内容，允许这一次？”。hook 最多等 110 秒：批准则放行这一次调用，拒绝、超时或注入工具不可达都拦下，并把原因告诉 agent。
+请求里只有别名、工具名、目标（文件路径或 URL）和调用摘要，没有密码。
 
-批准只对那一次调用有效，同样的调用再来一次是新的请求；用户拒绝过的同一调用在任务内保持拒绝。批准读取意味着内容会进入 agent 的上下文，审批卡片上有这句提示。
+### 三个场景
 
-### 匹配范围和已知缺口
+| 场景 | 经过 |
+| --- | --- |
+| secret 检测 | 审批端存 `age` = `18year`。`example/qa.txt` 内容是 `I am 18year old.`。agent 读这个文件，hook 在内容到达 agent 之前检出密码并触发审批；批准后 agent 看到 `I am {{secretref:age}} old.`。之后 agent 写出含 `{{secretref:age}}` 的内容时再次审批，批准后落盘的是 `18year`。 |
+| 网站登录 | agent 让浏览器工具提交 `{"password": "{{secretref:shop_password}}"}`，审批端看到工具名和登录地址；批准后浏览器工具拿到真实密码。登录后的页面如果回显了密码，agent 看到的仍是引用。 |
+| 填写配置 | 用 DeepSeek 启动 Codex：agent 把 `experimental_bearer_token = "{{secretref:DEEPSEEK_API_TOKEN}}"` 写进 `~/.codex/config.toml`，审批端看到目标文件并询问；批准后文件里是真实的 key。agent 再读这个文件，看到的还是引用。 |
 
-- 文件名规则（`.env`、`*.pem`）：工具参数或命令里出现这个文件名；Grep 工具和递归读取的命令（`grep -r`、`rg`、`find`、`tar`、`cp -r` 等）会在搜索根目录下查找有没有这样的文件（最多看 2 万个条目）。
-- 固定路径规则（`~/.aws`）：读取该路径或其下的文件，符号链接、`..`、`$HOME`、通配写法都算；对它上层目录的递归读取也算。
-- 字符串规则：工具调用的参数里出现该字符串（不分大小写，去掉引号后也比对）。
-- **hook 在调用之前判断，看不到文件内容。** 没有被规则覆盖的文件里即使写着 `secret=a`，读它不会触发审批。要保护就把文件或文件名加进规则。
-- 运行时才拼出来的路径、先写脚本再执行、不经过 agent 工具的进程，都拦不住。
-- 注入工具没有运行时，装了 hook 的 agent 的所有工具调用都会被拦下（宁可拦错）。
+### 审批模式和审批面板
+
+```sh
+agentsecret approver secret-add DEEPSEEK_API_TOKEN                 # 保存的密码
+agentsecret approver secret-add DEEPSEEK_API_TOKEN --label team    # 同名的另一个副本
+agentsecret approver mode all --minutes 10                         # 10 分钟内全部同意
+agentsecret approver mode ask                                      # 恢复逐条询问
+agentsecret approver auto-add --kind fill --secret 'DEEPSEEK_*' --tool Write --target '*/.codex/config.toml'
+agentsecret approver auto-list
+```
+
+- **按钮**：拒绝、允许（1 次）、其他。“其他”可以选允许 n 次或允许一段时间（3 分钟、10 分钟等）；之后同一项目里、同一类请求、同一组密码的请求自动批准，直到次数用完或时间到。
+- **修改返回的密码**：批准 `fill` 或 MCP 的使用请求时，可以改成返回同名的另一个副本、mock（形状相同的假值，不告诉它真密码但也不拒绝），或手动输入的值。
+- **all**：一段时间内所有能批准的请求都自动批准。
+- **auto**：规则由请求类型、密码别名、工具名、目标四项组成，每项可用 `*` 通配，全部符合就自动批准。
+
+这些模式都是审批端替用户作答：每个请求仍然单独签名，server 和注入工具看到的协议没有变化。所以审批端（`approver run` 或浏览器页面）必须在运行，自动批准才会发生。确定不能批准的请求（没有这条密码等）仍然立即拒绝并带原因。终端审批端在提示处输入 `yes`、`3x`、`10m`，再选择返回值。
+
+### 已知缺口
+
+- **只验证了 hook 进程本身。** 测试给真实的 hook 进程喂 Claude Code 文档里的事件格式，并执行它返回的 `updatedInput` / `updatedToolOutput`；没有在真实的 Claude Code 或 Codex 会话里跑过。工具结果的字段形状是按文档和常见结构处理的（递归替换所有字符串），真实会话里如果 `updatedToolOutput` 要求别的形状，需要调整。
+- **改不了 agent 的最终回答。** hook 只能改工具的输入和输出。agent 在回复里写 `{{secretref:age}}`，用户看到的就是引用本身。
+- 批准 `fill` 时 hook 返回 `permissionDecision: allow`，这次调用不再走 Claude Code 自己的权限询问。
+- 填进去的密码会出现在那次工具调用的效果里（写进文件、发给网站）。之后的工具结果里如果再出现，会再次被换成引用；但 Claude Code 的会话记录是否保存改写后的输入没有验证。
+- 网站登录用本地假网站和模拟的浏览器工具调用验证，没有接真实的浏览器 agent。
+- 手动输入的返回值配合“允许 n 次/一段时间”时会保存在审批端（终端版加密保存，浏览器版在浏览器存储里）。
+- 注入工具没有运行时，装了 hook 的 agent 读不到任何工具结果（全部扣留），带引用的调用全部拦下。
+- 每兆字节内容的扫描在本机约 1 秒（纯 Python）；单次最多扫描 4 MB，超过则扣留。
 
 ## 签名与密封
 
@@ -145,7 +169,7 @@ secret-guard mcp --token-file /absolute/path/run-01.token
 
 ## 已验证
 
-`python -m unittest tests.test_split`，21 条，全部使用进程内或本机回环的 server：
+`python -m unittest discover`，67 条（1 条因本机没有 Codex 跳过），全部使用进程内或本机回环的 server：
 
 | 检查 | 结果 |
 | --- | --- |
@@ -161,10 +185,12 @@ secret-guard mcp --token-file /absolute/path/run-01.token
 | 拒绝保持、过期、跨任务引用、撤销审批端、结果回显密码、崩溃恢复为 unknown | 通过 |
 | 原有 MCP bridge 直接连注入工具 | 通过 |
 | HTTP 往返，server 没有注册、导出类路由 | 通过 |
-| 审批端设置规则，签名下发；server 伪造或回放旧规则 | 注入工具只认已配对审批端的新版本 |
-| 真实 hook 进程：普通调用放行；`cat .env` 等到审批端批准才放行；拒绝则拦下并带原因；自身状态直接拒绝 | 通过 |
+| 匹配器签名下发；server 伪造或回放旧版本；明文不在线路、server 和注入工具的文件里 | 注入工具只认已配对审批端的新版本；通过 |
+| 三个场景（`tests/test_scenarios.py`，真实 hook 进程）：检测、替换为引用、还原；DeepSeek 配置；本地假网站登录 | 通过 |
+| 允许 n 次、允许一段时间、全部同意、规则自动审批；返回副本、mock、手动输入 | 通过 |
+| 拒绝、无人应答、注入工具不可达 | 内容扣留，带引用的调用被拦下 |
 
-浏览器审批端另用无头 Chromium 手动跑通了一遍：照页面“设置步骤”打印的命令逐条执行完成登记和配对，录入假密码（含空格的 3 字符密码），批准一次性引用和一次使用，Python 注入工具解开并使用了页面密封的密码；未知密码和策略外仓库的请求被页面自动拒绝，调用方拿到了原因。这一遍没有纳入自动测试。2026-11-20 又用同样的方式跑了读取审批：在页面上加规则 `.env` 和 `GITHUB_TOKEN`，`claude-config` 生成的 hook 对 `cat .env` 等到页面点批准后放行，对 `echo $GITHUB_TOKEN` 在页面点拒绝后拦下。hook 没有在真实的 Claude Code 或 Codex 会话里跑过这条新路径。
+浏览器审批端另用无头 Chromium 手动跑通了一遍：照页面“设置步骤”打印的命令逐条执行完成登记和配对，录入假密码（含空格的 3 字符密码），批准一次性引用和一次使用，Python 注入工具解开并使用了页面密封的密码；未知密码和策略外仓库的请求被页面自动拒绝，调用方拿到了原因。这一遍没有纳入自动测试。2026-11-20 又用同样的方式在浏览器审批端上跑了场景 1 和场景 3：页面录入 `age` 和 `DEEPSEEK_API_TOKEN`（含副本 team），读 `qa.txt` 时页面出现审批卡片，批准后 hook 返回 `I am {{secretref:age}} old.`；写配置时依次选了副本、mock、手动输入加“允许 3 次”、全部同意模式和自动审批规则，结果都符合预期，server 和注入工具的数据库里没有明文。
 
 ## 与架构文档的差别和未完成项
 

@@ -10,6 +10,7 @@ from .broker import GuardError
 from .crypto import canonical
 
 MAX_REQUEST = 16 * 1024
+MAX_SCAN_REQUEST = 16 * 1024 * 1024
 
 
 def handler(broker, role):
@@ -65,7 +66,8 @@ def handler(broker, role):
                 if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Type") != "application/json":
                     raise GuardError("request_invalid")
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= MAX_REQUEST:
+                # The hook sends whole tool results to be scanned; everything else stays small.
+                if not 0 < length <= (MAX_SCAN_REQUEST if role == "agent" and self.path == "/scan" else MAX_REQUEST):
                     raise GuardError("request_invalid")
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
@@ -79,10 +81,12 @@ def handler(broker, role):
                     elif self.path == "/status" and set(body) == {"operation_id"}:
                         result = broker.status(token, body["operation_id"])
                     # Used by the agent hook; only the injector backend has them.
-                    elif self.path == "/rules" and not body and hasattr(broker, "rules"):
-                        result = broker.rules(token)
-                    elif self.path == "/access" and set(body) == {"tool", "rule", "summary", "call"} and hasattr(broker, "access"):
-                        result = broker.access(token, **body)
+                    elif self.path == "/scan" and set(body) == {"texts"} and hasattr(broker, "scan"):
+                        result = broker.scan(token, body["texts"])
+                    elif self.path == "/hook" and set(body) == {"kind", "tool", "target", "summary", "call", "secrets"} and hasattr(broker, "hook_request"):
+                        result = broker.hook_request(token, **body)
+                    elif self.path == "/take" and set(body) == {"operation_id"} and hasattr(broker, "take"):
+                        result = broker.take(token, body["operation_id"])
                     else:
                         raise GuardError("route_unavailable")
                 else:

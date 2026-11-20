@@ -276,7 +276,7 @@ class SplitTests(unittest.TestCase):
             blob = row["ciphertext"]
             self.assertEqual(self.app.vault.decrypt(blob[:12], blob[12:], json.dumps([alias, 1], separators=(",", ":")).encode()).decode(), value)
         for args, code in [(("bad alias", "x", ["acme/payments"]), "alias_invalid"), (("a", "", ["acme/payments"]), "secret_empty"),
-                           (("a", "x", ["nope"]), "repo_invalid"), (("a", "x", []), "empty_policy"), (("a", "x" * 70000, ["acme/payments"]), "secret_too_large")]:
+                           (("a", "x", ["nope"]), "repo_invalid"), (("a", "x" * 70000, ["acme/payments"]), "secret_too_large")]:
             with self.assertRaisesRegex(GuardError, code):
                 self.app.add_secret(*args)
         # The largest credential still travels sealed through the relay to the injector.
@@ -287,107 +287,38 @@ class SplitTests(unittest.TestCase):
         self.inj.run_ready()
         self.assertEqual(self.calls[-1][1], "k" * 60000)
 
-    def test_reading_protected_content_triggers_an_approval(self):
-        self.app.set_rule("path", ".env")
-        self.app.set_rule("text", "GITHUB_TOKEN")
-        self.app.publish_rules()
-        self.assertTrue(self.inj.sync_rules())
-        rules = self.inj.rules(self.t)["rules"]
-        self.assertEqual(rules, [{"kind": "path", "value": ".env"}, {"kind": "text", "value": "GITHUB_TOKEN"}])
-        call = "ab" * 32
-        op = self.inj.access(self.t, "Bash", rules[0], "cat .env", call)["operation_id"]
-        self.assertEqual(self.inj.access(self.t, "Bash", rules[0], "cat .env", call)["operation_id"], op)
-        item = next(p for p in self.app.pending() if p["request_id"] == op)
-        self.assertEqual((item["payload"]["kind"], item["problem"]), ("access", None))  # Needs no credential on the approver.
-        self.inj.run_ready()
-        self.assertEqual(self.state(op), "pending")  # Nothing passes before the user decides.
-        self.app.decide(item, "approve")
-        self.inj.run_ready()
-        self.assertEqual(self.inj.status(self.t, op), {"operation_id": op, "state": "approved"})
-        self.assertNotIn("sealed", "".join(self.wire))
-        # Approval covers that one call: the same call again is a new request, and a denial sticks.
-        again = self.inj.access(self.t, "Bash", rules[0], "cat .env", call)["operation_id"]
-        self.assertNotEqual(again, op)
-        self.decide(again, "deny")
-        self.inj.run_ready()
-        self.assertEqual(self.inj.access(self.t, "Bash", rules[0], "cat .env", call)["reason"], "user_denied")
-        with self.assertRaisesRegex(GuardError, "arguments_invalid"):
-            self.inj.access(self.t, "Bash", {"kind": "path", "value": "made-up"}, "x", call)
-        # A rule removed on the approver is rejected there with a reason, then disappears here.
-        other = self.inj.access(self.t, "Read", rules[1], "{}", "cd" * 32)["operation_id"]
-        self.app.set_rule("text", "GITHUB_TOKEN", present=False)
-        self.app.pending()
-        self.inj.run_ready()
-        self.assertEqual(self.inj.status(self.t, other)["reason"], "rule_unknown")
-        self.now += 1
-        self.app.publish_rules()
-        self.inj.sync_rules()
-        self.assertEqual(self.inj.rules(self.t)["rules"], [rules[0]])
-
-    def test_relay_can_neither_invent_nor_roll_back_rules(self):
-        self.app.set_rule("path", ".env")
-        self.app.publish_rules()
+    def test_relay_can_neither_invent_nor_roll_back_matchers(self):
+        self.app.publish_matchers()
         old = json.loads(next(w for w in self.wire if "/approver/rules" in w))[1]
         self.inj.sync_rules()
+        self.assertEqual(self.inj.scan(self.t, ["x " + CANARY + " y", "nothing"])["found"], [[[2, 2 + len(CANARY), "github"]], []])
         self.now += 1
-        self.app.set_rule("path", "*.pem")
-        self.app.publish_rules()
+        self.app.add_secret("second", "another-secret-value")
+        self.app.publish_matchers()
         self.inj.sync_rules()
-        self.assertEqual(len(self.inj.rules(self.t)["rules"]), 2)
+        found = lambda: [h[2] for h in self.inj.scan(self.t, [CANARY + " another-secret-value"])["found"][0]]
+        self.assertEqual(found(), ["github", "second"])
         rogue = load_or_create_key(self.root / "rogue.key")
         self.relay.register_device("rogue", "alice", "approver", jwk(rogue))
-        text = json.dumps({"approver": "rogue", "version": 9 ** 15, "rules": []})
+        text = json.dumps({"approver": "rogue", "version": 9 ** 15, "base": "1000", "matchers": []})
         self.relay.publish_rules(self.login("rogue", rogue), text, sign(rogue, protocol.rules_message(text)))
-        with self.relay.tx() as db:  # The relay replays the approver's older, smaller rule set.
+        with self.relay.tx() as db:  # The relay replays the approver's older, smaller set.
             db.execute("UPDATE rules SET rules_text=?, signature=? WHERE approver=?", (old["rules_text"], old["signature"], self.app.device))
         self.inj.sync_rules()
-        self.assertEqual(len(self.inj.rules(self.t)["rules"]), 2)
-
-    def test_hook_blocks_until_the_approver_allows_the_read(self):
-        import subprocess, sys, time
-        from secret_guard import claude_hook, cli
-        from secret_guard.server import make_server
-        self.inj.clock = self.app.clock = self.relay.clock = time.time  # Real time: the hook is a separate process.
-        self.t = self.inj.new_task("payments")["token"]
-        token = self.root / "run.token"
-        token.write_text(self.t)
-        work = self.root / "work"
-        work.mkdir()
-        (work / ".env").write_text("secret=a")
-        self.app.set_rule("path", ".env")
-        self.app.publish_rules()
-        self.inj.sync_rules()
-        server = make_server(self.inj, "agent", "127.0.0.1", 0)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        stop, decision = threading.Event(), ["approve"]
-
-        def background():
-            while not stop.wait(0.1):
-                for item in self.app.pending():
-                    self.app.decide(item, decision[0])
-                self.inj.run_ready()
-        threading.Thread(target=background, daemon=True).start()
-        try:
-            settings = cli.claude_settings([self.root / "injector"], (f"http://{server.expected_host}", token))
-            command = settings["hooks"]["PreToolUse"][0]["hooks"][0]
-
-            def hook(tool, **tool_input):
-                return subprocess.run(command["command"], shell=True, capture_output=True, text=True,
-                                      input=json.dumps({"tool_name": tool, "tool_input": tool_input, "cwd": str(work)}))
-            self.assertEqual(command["timeout"], 130)
-            self.assertEqual(hook("Bash", command="ls").returncode, 0)
-            self.assertEqual(hook("Bash", command="cat .env").returncode, 0)  # Approved on the approver.
-            decision[0] = "deny"
-            denied = hook("Read", file_path=str(work / ".env"))
-            self.assertEqual(denied.returncode, 2)
-            self.assertIn("用户拒绝了这次请求", denied.stderr)
-            self.assertEqual(hook("Read", file_path=str(self.root / "injector/device.key")).returncode, 2)  # Own state: never offered.
-            events = [e["event"] for e in self.app.activity()]
-            self.assertEqual((events.count("approved"), events.count("denied")), (1, 1))
-        finally:
-            stop.set()
-            server.shutdown()
-            server.server_close()
+        self.assertEqual(found(), ["github", "second"])
+        # The compiled set holds no credential, on the wire or at rest.
+        self.assertNotIn(CANARY, "".join(self.wire))
+        for path in (self.root / "injector").iterdir():
+            self.assertNotIn(CANARY.encode(), path.read_bytes())
+        # An approved fill is handed to the hook once and never stored.
+        op = self.inj.hook_request(self.t, "fill", "Write", "/x", "…", "ab" * 32, ["github"])["operation_id"]
+        self.decide(op)
+        self.inj.run_ready()
+        self.assertEqual(self.inj.take(self.t, op), {"values": {"github": CANARY}})
+        with self.assertRaisesRegex(GuardError, "operation_unavailable"):
+            self.inj.take(self.t, op)
+        for path in (self.root / "injector").iterdir():
+            self.assertNotIn(CANARY.encode(), path.read_bytes())
 
     def test_relay_surface(self):
         token = self.inj.link.token or self.login(self.inj.device, self.inj.signing)

@@ -12,11 +12,12 @@ REQUEST = "secret-guard/request/v1:"
 DECISION = "secret-guard/decision/v3:"
 RULES = "secret-guard/rules/v1:"
 MAX_REQUEST_TEXT = 8192
-MAX_RULES_TEXT = 32768
-# What the agent's own tools may not read without approval. Set on the approver, signed,
-# and enforced by the hook beside the agent. "path" is a file, directory or file-name
-# pattern (.env, *.pem, ~/.aws); "text" is a string that may not appear in a tool call.
-RULE_KINDS = ("path", "text")
+MAX_RULES_TEXT = 512 * 1024
+# The agent meets a credential in two ways besides asking for one over MCP:
+#   reveal: content a tool returned contains a credential; approved, it reaches the agent with a reference in its place
+#   fill:   a tool call carries a reference; approved, the reference becomes the credential just before the tool runs
+HOOK_KINDS = ("reveal", "fill")
+REF = "secretref://"
 USE_TTL = 120
 # A reference is "once" (starts exactly one use request) or "long" (reusable until it
 # expires). Either way it lasts at most REF_TTL from approval and every use is approved separately.
@@ -29,7 +30,6 @@ REASONS = {
     "policy_denied": "该密码不允许用于这个仓库",
     "request_changed": "请求与固定操作不符",
     "request_invalid": "请求格式无效",
-    "rule_unknown": "这条保护规则已不在审批端上",
     "signature_invalid": "请求签名无效，可能在传输中被改动",
 }
 # Reasons the injector determines itself.
@@ -45,8 +45,9 @@ ERRORS = {
     "secret_too_large": "密码超过 64 KB，超出一次密封转发的上限。",
     "repo_invalid": "仓库格式无效：应为 owner/name。",
     "empty_policy": "至少要填一个允许使用的仓库。",
-    "rule_invalid": "保护规则无效：路径或文件名不能为空，字符串至少 3 个字符，都不超过 256 个字符。",
-    "rule_unknown": "没有这条保护规则。",
+    "copy_unknown": "这个别名下没有这个副本。",
+    "rule_invalid": "自动审批规则无效。",
+    "choice_invalid": "返回值的选择无效：可以是 default、copy:<副本名>、mock 或 manual:<内容>。",
 }
 
 
@@ -66,15 +67,9 @@ def rules_message(rules_text):
     return RULES + rules_text
 
 
-def valid_rule(rule):
-    return (isinstance(rule, dict) and set(rule) == {"kind", "value"} and rule["kind"] in RULE_KINDS
-            and isinstance(rule["value"], str) and 0 < len(rule["value"]) <= 256 and rule["value"] == rule["value"].strip()
-            and not any(ord(c) < 32 for c in rule["value"]) and (rule["kind"] == "path" or len(rule["value"]) >= 3))
-
-
-def access_details(tool, rule, summary, call):
-    """One tool call of the agent that would read protected content."""
-    return {"scope": "read_once", "tool": tool, "rule": rule, "summary": summary, "call": call}
+def hook_details(kind, tool, target, summary, call, secrets):
+    """One tool call of the agent, as the hook saw it, and the credentials it involves."""
+    return {"scope": kind, "tool": tool, "target": target, "summary": summary, "call": call, "secrets": secrets}
 
 
 def explain(code):

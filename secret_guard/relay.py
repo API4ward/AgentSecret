@@ -159,7 +159,7 @@ class Relay:
             if canonical(payload) != request_text or payload["domain"] != protocol.REQUEST_DOMAIN:
                 raise ValueError
             request_id, kind, expires = payload["request_id"], payload["kind"], payload["expires_at"]
-            if not IDENT.fullmatch(request_id) or kind not in {"reference", "use", "access"} or type(expires) not in {int, float}:
+            if not IDENT.fullmatch(request_id) or kind not in {"reference", "use", *protocol.HOOK_KINDS} or type(expires) not in {int, float}:
                 raise ValueError
         except Exception:
             raise GuardError("request_invalid") from None
@@ -192,7 +192,7 @@ class Relay:
             out = {"state": self.live(db, row)}
             if out["state"] == "approved":
                 out.update(approver=row["approver"], signature=row["approval"])
-                if row["kind"] == "use":
+                if row["kind"] in ("use", "fill"):
                     # One delivery only. The box leaves the relay and is not kept.
                     out["sealed"] = json.loads(row["sealed"])
                     db.execute("UPDATE requests SET state='delivered',sealed=NULL WHERE id=?", (request_id,))
@@ -203,7 +203,7 @@ class Relay:
             return out
 
     def rules(self, token):
-        """Protection rules of this user's approvers, each still carrying its approver's signature."""
+        """Compiled matchers of this user's approvers, each still carrying its approver's signature."""
         with self.tx() as db:
             injector = self.session(db, token, "injector")
             rows = db.execute("SELECT r.* FROM rules r JOIN devices d ON d.id=r.approver WHERE r.user=? AND d.active=1", (injector["user"],)).fetchall()
@@ -254,7 +254,7 @@ class Relay:
                 raise GuardError("request_not_pending")
             self.device(db, row["injector"], "injector")
             # Only an approved use carries a credential, and it must arrive sealed.
-            needs_box = decision == "approve" and row["kind"] == "use"
+            needs_box = decision == "approve" and row["kind"] in ("use", "fill")
             if needs_box != (sealed is not None) or (needs_box and not valid_box(sealed)):
                 raise GuardError("decision_invalid")
             try:

@@ -39,12 +39,38 @@ async function api(path, body, auth = false, retry = true) {
   if (auth && retry && data.error === "device_unauthorized") { await login(); return api(path, body, true, false); }
   throw Object.assign(new Error(data.error || "请求失败"), {code: data.error});
 }
-// The whole rule set, signed, for this user's injectors. The relay only stores and forwards it.
-async function publishRules() {
+// Small approver-side state (approval modes) lives beside the device key.
+const state = async (key, fallback) => (await get("device", key)) ?? fallback;
+async function plain(secret, label = "default") {
+  const c = label === "default" ? secret : secret.copies[label];
+  return new TextDecoder().decode(await crypto.subtle.decrypt({name: "AES-GCM", iv: c.iv, additionalData: bytes(secret.alias + (label === "default" ? "" : "\u0000" + label))}, device.vault, c.ct));
+}
+// Compiled matchers, identical to secret_guard/matcher.py: length, 16-bit rolling-hash tag, salted PBKDF2 digest.
+// The plaintext stays here; the injector receives only what lets it recognise a credential.
+const MOD = (1n << 61n) - 1n;
+async function compile(alias, value, base) {
+  const data = bytes(value);
+  if (data.length < 4) return null;
+  let h = 0n; for (const b of data) h = (h * base + BigInt(b)) % MOD;
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", data, "PBKDF2", false, ["deriveBits"]);
+  const digest = await crypto.subtle.deriveBits({name: "PBKDF2", hash: "SHA-256", salt, iterations: 50000}, key, 256);
+  return {alias, length: data.length, tag: Number(h & 0xFFFFn), salt: b64(salt), digest: b64(digest)};
+}
+async function publishMatchers() {
   if (!session) return;
-  const rules = (await all("rules")).map(r => ({kind: r.kind, value: r.value})).sort((a, b) => (a.kind + a.value < b.kind + b.value ? -1 : 1));
-  const text = JSON.stringify({approver: device.id, version: Date.now(), rules});
+  const random = new BigUint64Array(1); crypto.getRandomValues(random);
+  const base = random[0] % (MOD - 257n) + 257n, matchers = [];
+  for (const secret of await all("secrets")) for (const label of ["default", ...Object.keys(secret.copies || {})]) {
+    const m = await compile(secret.alias, await plain(secret, label), base); if (m) matchers.push(m);
+  }
+  const text = JSON.stringify({approver: device.id, version: Date.now(), base: base.toString(), matchers});
   await api("/approver/rules", {rules_text: text, signature: await sign("secret-guard/rules/v1:" + text)}, true);
+}
+function mock(value) {
+  const pick = pool => pool[crypto.getRandomValues(new Uint32Array(1))[0] % pool.length], low = "abcdefghijklmnopqrstuvwxyz";
+  const cut = Math.max(value.slice(0, 8).indexOf("-"), value.slice(0, 8).indexOf("_")) + 1;
+  return value.slice(0, cut) + [...value.slice(cut)].map(c => /[0-9]/.test(c) ? pick("0123456789") : /[a-z]/.test(c) ? pick(low) : /[A-Z]/.test(c) ? pick(low.toUpperCase()) : c).join("");
 }
 async function login() {
   session = null;
@@ -133,12 +159,14 @@ async function show() {
   $("create").disabled = Boolean(device); $("user").disabled = Boolean(device);
   $("injectors").replaceChildren(); $("secrets").replaceChildren();
   for (const i of await all("injectors")) addText($("injectors"), "li", i.id);
-  for (const s of await all("secrets")) addText($("secrets"), "li", `${s.alias} · 允许 ${s.repos.join("、")}`);
-  $("rules").replaceChildren();
-  for (const rule of await all("rules")) {
-    const li = addText($("rules"), "li", `${rule.kind === "path" ? "文件" : "字符串"} · ${rule.value}`), button = addText(li, "button", "移除"); button.className = "deny";
-    button.onclick = async () => { try { await db("rules", "readwrite", s => s.delete(rule.kind + ":" + rule.value)); await publishRules(); } catch (e) { $("message").textContent = e.message; } await show(); };
-  }
+  for (const s of await all("secrets")) addText($("secrets"), "li", s.alias + (Object.keys(s.copies || {}).length ? ` · 副本 ${Object.keys(s.copies).join("、")}` : "") + (s.repos.length ? ` · GitHub 仓库 ${s.repos.join("、")}` : ""));
+  const until = await state("allUntil", 0), rules = await state("autoRules", []);
+  $("all-state").textContent = until > Date.now() ? `全部同意模式开启，到 ${new Date(until).toLocaleTimeString()} 为止。` : "当前逐条询问。";
+  $("auto-rules").replaceChildren();
+  rules.forEach((rule, index) => {
+    const li = addText($("auto-rules"), "li", `类型 ${rule.kind} · 密码 ${rule.secret} · 工具 ${rule.tool} · 目标 ${rule.target}`), button = addText(li, "button", "移除"); button.className = "deny";
+    button.onclick = async () => { await put("device", "autoRules", rules.filter((_, i) => i !== index)); await show(); };
+  });
   await steps();
 }
 function action(id, fn) { $(id).onclick = async () => { $("message").textContent = ""; $(id).disabled = true; try { await fn(); } catch (e) { $("message").textContent = e.message; } finally { $(id).disabled = false; await show(); } }; }
@@ -154,7 +182,7 @@ action("create", async () => {
 });
 action("connect", async () => {
   if (!device) throw new Error("请先生成设备，并在服务器和注入工具上登记公钥。");
-  await login(); await publishRules(); await refresh(true);
+  await login(); await publishMatchers(); await refresh(true);
   $("message").textContent = "已连接。本页开着时会自动获取新的请求。";
 });
 action("pair", async () => {
@@ -176,24 +204,50 @@ action("add", async () => {
   if (!/^[A-Za-z0-9_.-]{1,64}$/.test(alias)) fail("alias", "别名无效：用 1 到 64 个字母、数字、点、下划线或连字符。别名用来区分每一条密码。");
   if (!value) fail("value", "请输入密码。密码内容由你管理，本设备不检查格式，只负责保存、密封并转发。");
   if (bytes(value).length > 65536) fail("value", "密码超过 64 KB，超出一次密封转发的上限。");
-  if (!repos.length) fail("repos", "至少要填一个允许使用的仓库，格式为 owner/name。");
   const bad = repos.filter(r => !REPO.test(r));
   if (bad.length) fail("repos", `仓库格式无效：${bad.join("、")}。应为 owner/name。`);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({name: "AES-GCM", iv, additionalData: bytes(alias)}, device.vault, bytes(value));
-  await put("secrets", alias, {alias, iv, ct, repos});
+  await put("secrets", alias, {alias, iv, ct, repos, copies: (await get("secrets", alias) || {}).copies || {}});
   $("alias").value = $("value").value = $("repos").value = "";
+  await publishMatchers();
 });
+action("add-copy", async () => {
+  // A further copy under the same alias, for example a second API key of the same service.
+  const alias = $("copy-alias").value.trim(), label = $("copy-label").value.trim(), value = $("copy-value").value, secret = await get("secrets", alias);
+  if (!secret) throw new Error("没有这个别名的密码，请先添加它。");
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(label) || label === "default") throw new Error("副本名无效：用 1 到 64 个字母、数字、点、下划线或连字符。");
+  if (!value) throw new Error("请输入这个副本的密码。");
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  secret.copies = {...secret.copies, [label]: {iv, ct: await crypto.subtle.encrypt({name: "AES-GCM", iv, additionalData: bytes(alias + "\u0000" + label)}, device.vault, bytes(value))}};
+  await put("secrets", alias, secret);
+  $("copy-alias").value = $("copy-label").value = $("copy-value").value = "";
+  await publishMatchers();
+});
+// Approval modes: this page answering for the user. Every answer is still an individually signed decision.
+action("all-on", async () => { await put("device", "allUntil", Date.now() + Math.max(1, Number($("all-minutes").value) || 10) * 60000); });
+action("all-off", async () => { await put("device", "allUntil", 0); });
+action("auto-add", async () => {
+  const rule = {kind: $("auto-kind").value, secret: $("auto-secret").value.trim() || "*", tool: $("auto-tool").value.trim() || "*", target: $("auto-target").value.trim() || "*"};
+  await put("device", "autoRules", [...await state("autoRules", []), rule]);
+});
+const glob = (pattern, text) => new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*").replaceAll("?", ".") + "$").test(text);
+const HOOK = {reveal: "工具返回的内容里有密码；批准后以引用代替密码交给 agent", fill: "工具调用里有密码引用；批准后把引用换成密码再执行"};
+function facets(p) {
+  const d = p.details;
+  return HOOK[p.kind] ? {kind: p.kind, names: d.secrets, tool: d.tool, target: d.target} : {kind: p.kind, names: [p.secret_id], tool: p.kind === "use" ? "github" : "", target: (d.args || {}).repo || ""};
+}
+// Whether a mode answers this request without the user: {why, choices} or null.
+async function automatic(p) {
+  const f = facets(p);
+  if (await state("allUntil", 0) > Date.now()) return {why: "全部同意模式"};
+  const grants = await state("grants", []), key = JSON.stringify([f.kind, f.names, p.project]);
+  const g = grants.find(g => g.key === key && (g.expires === null || g.expires > Date.now()) && (g.remaining === null || g.remaining > 0));
+  if (g) { if (g.remaining !== null) g.remaining -= 1; await put("device", "grants", grants); return {why: "此前选择的多次或限时允许", choices: g.choices}; }
+  for (const r of await state("autoRules", [])) if ((r.kind === "*" || r.kind === f.kind) && f.names.every(n => glob(r.secret, n)) && glob(r.tool, f.tool) && glob(r.target, f.target)) return {why: "自动审批规则"};
+  return null;
+}
 
-action("protect", async () => {
-  if (!device) throw new Error("请先生成设备。");
-  const kind = $("rule-kind").value, value = $("rule-value").value.trim();
-  if (!value || value.length > 256 || /[\u0000-\u001f]/.test(value) || (kind === "text" && value.length < 3)) throw new Error("保护规则无效：路径或文件名不能为空，字符串至少 3 个字符，都不超过 256 个字符。");
-  await put("rules", kind + ":" + value, {kind, value});
-  $("rule-value").value = "";
-  await publishRules();
-  if (!session) $("message").textContent = "已保存。连接服务器后才会下发给注入工具。";
-});
 // Rules come before the prompt. Returns a problem code, or "" when approval may be offered.
 async function check(entry, p) {
   const injector = await get("injectors", p.injector);
@@ -203,12 +257,13 @@ async function check(entry, p) {
   if (p.domain !== "secret-guard/approval/v2" || p.principal !== device.user) return "request_invalid";
   if (!(p.expires_at * 1000 > Date.now())) return "expired";
   const d = p.details;
-  if (p.kind === "access") {
-    // A read of protected content carries no credential; the rule it names must be one of ours.
-    const ok = d && Object.keys(d).length === 5 && d.scope === "read_once" && ["tool", "summary", "call"].every(k => typeof d[k] === "string")
-      && d.rule && Object.keys(d.rule).length === 2 && typeof d.rule.kind === "string" && typeof d.rule.value === "string";
+  if (HOOK[p.kind]) {
+    // The hook's requests name credentials by alias; every one must be stored here.
+    const ok = d && Object.keys(d).length === 6 && d.scope === p.kind && ["tool", "target", "summary", "call"].every(k => typeof d[k] === "string")
+      && Array.isArray(d.secrets) && d.secrets.length && d.secrets.every(a => typeof a === "string");
     if (!ok) return "request_invalid";
-    return await get("rules", d.rule.kind + ":" + d.rule.value) ? "" : "rule_unknown";
+    for (const alias of d.secrets) if (!await get("secrets", alias)) return "secret_unavailable";
+    return "";
   }
   const secret = await get("secrets", p.secret_id);
   if (!secret) return "secret_unavailable";
@@ -221,17 +276,32 @@ async function check(entry, p) {
   return "";
 }
 // A reason marks an automatic rejection; it is signed, and the injector shows it to the caller.
-async function decide(entry, p, decision, reason = "") {
-  const body = {request_id: p.request_id, decision};
+// choices: {alias: "default" | "copy:<label>" | "mock" | "manual:<text>"} is what gets returned.
+// grant: {times} or {seconds} answers the same kind of request again without asking.
+async function resolve(alias, choice = "default") {
+  const secret = await get("secrets", alias);
+  if (choice === "mock") return mock(await plain(secret));
+  if (choice.startsWith("manual:") && choice.length > 7) return choice.slice(7);
+  if (choice.startsWith("copy:") && !(secret.copies || {})[choice.slice(5)]) throw new Error("这个别名下没有这个副本。");
+  return plain(secret, choice.startsWith("copy:") ? choice.slice(5) : "default");
+}
+async function decide(entry, p, decision, reason = "", choices = {}, grant = null) {
+  const body = {request_id: p.request_id, decision}, f = facets(p);
   if (reason) body.reason = reason;
-  if (decision === "approve" && p.kind === "use") {
-    const secret = await get("secrets", p.secret_id), injector = await get("injectors", p.injector);
-    const value = await crypto.subtle.decrypt({name: "AES-GCM", iv: secret.iv, additionalData: bytes(secret.alias)}, device.vault, secret.ct);
+  if (decision === "approve" && (p.kind === "use" || p.kind === "fill")) {
+    const injector = await get("injectors", p.injector), picked = {};
+    for (const alias of f.names) picked[alias] = await resolve(alias, choices[alias]);
     // Sealed to the key recorded at pairing, never to a key the relay supplies.
-    body.sealed = await seal(injector.enc_jwk, value, await sealAad(entry.request_text));
+    body.sealed = await seal(injector.enc_jwk, bytes(p.kind === "use" ? picked[f.names[0]] : JSON.stringify(picked)), await sealAad(entry.request_text));
   }
   body.signature = await sign("secret-guard/decision/v3:" + decision + ":" + reason + ":" + device.id + ":" + entry.request_text);
   await api("/approver/decision", body, true);
+  if (decision === "approve" && grant) await put("device", "grants", [...await state("grants", []), {key: JSON.stringify([f.kind, f.names, p.project]),
+    remaining: grant.times ? grant.times - 1 : null, expires: grant.seconds ? Date.now() + grant.seconds * 1000 : null, choices}]);
+}
+function note(id, p, text) {
+  addText($(id), "li", `${new Date().toLocaleTimeString()} · 密码 ${facets(p).names.join("、")} · 项目 ${p.project} · ${text}`);
+  while ($(id).children.length > 20) $(id).firstChild.remove();
 }
 async function refresh(force = false) {
   if (!session) throw new Error("请先连接服务器。");
@@ -244,13 +314,11 @@ async function refresh(force = false) {
     if (problem === "expired") continue;
     if (problem) {
       // Rules come before the prompt: what this device can never approve is rejected now, with the reason.
-      try {
-        await decide(entry, p, "deny", problem);
-        addText($("rejected"), "li", `${new Date().toLocaleTimeString()} · ${p.kind === "access" ? "读取受保护内容" : "密码 " + p.secret_id} · 项目 ${p.project} · ${REASONS[problem]}`);
-        while ($("rejected").children.length > 20) $("rejected").firstChild.remove();
-      } catch (e) {}
+      try { await decide(entry, p, "deny", problem); note("rejected", p, REASONS[problem]); } catch (e) {}
       continue;
     }
+    const auto = await automatic(p);
+    if (auto) { try { await decide(entry, p, "approve", "", auto.choices || {}); note("automatic", p, auto.why); continue; } catch (e) {} }
     items.push([entry, p]);
   }
   await steps();
@@ -260,18 +328,37 @@ async function refresh(force = false) {
   if (!items.length) addText($("requests"), "p", "暂无待审批请求。");
   for (const [entry, p] of items) {
     const card = document.createElement("article"); card.className = "card";
-    addText(card, "h2", p.kind === "reference" ? "允许任务引用密码？" : p.kind === "access" ? "agent 要读取受保护内容，允许这一次？" : "允许这一次具体使用？");
+    const d = p.details, f = facets(p);
+    addText(card, "h2", {reference: "允许任务引用密码？", use: "允许这一次具体使用？", reveal: "agent 读到的内容里有密码，允许以引用形式交给它？", fill: "agent 要把密码填进这次调用，允许吗？"}[p.kind]);
     const list = document.createElement("dl"); card.appendChild(list);
-    const d = p.details;
-    const operation = p.kind === "reference" ? `引用（${REF_TYPES[d.type]}）；每次使用仍需单独批准` : p.kind === "access" ? `工具 ${d.tool}：${d.summary}` : `${d.method} ${d.scheme}://${d.host}:${d.port}${d.path}?${d.query}`;
-    const subject = p.kind === "access" ? ["命中的保护规则", `${d.rule.kind === "path" ? "文件" : "字符串"} · ${d.rule.value}`] : ["密码", p.secret_id];
-    for (const [label, value] of [["项目", p.project], subject, ["任务", p.task], ["注入工具", p.injector], ["操作", operation], ["请求有效期", new Date(p.expires_at * 1000).toLocaleString()]]) { addText(list, "dt", label); addText(list, "dd", String(value)); }
-    if (p.kind === "access") addText(card, "p", "批准后，这次调用读到的内容会进入 agent 的上下文。agent 只是需要用密码时，应让它通过 MCP 申请使用，而不是读取。").className = "hint";
-    const details = document.createElement("details"); addText(details, "summary", "查看完整冻结请求"); addText(details, "pre", entry.request_text); card.appendChild(details);
-    for (const decision of ["deny", "approve"]) {
-      const button = addText(card, "button", decision === "deny" ? "拒绝" : p.kind === "reference" ? (d.type === "once" ? "允许引用一次" : "允许引用 1 小时") : p.kind === "access" ? "仅允许这一次读取" : "仅允许这一次"); button.className = decision === "deny" ? "deny" : "";
-      button.onclick = async () => { card.querySelectorAll("button").forEach(b => b.disabled = true); try { await decide(entry, p, decision); await refresh(true); } catch (e) { $("message").textContent = e.message; card.querySelectorAll("button").forEach(b => b.disabled = false); } };
+    const operation = p.kind === "reference" ? `引用（${REF_TYPES[d.type]}）；每次使用仍需单独批准` : HOOK[p.kind] ? `${HOOK[p.kind]}。工具 ${d.tool}${d.target ? "，目标 " + d.target : ""}：${d.summary}` : `${d.method} ${d.scheme}://${d.host}:${d.port}${d.path}?${d.query}`;
+    for (const [label, value] of [["项目", p.project], ["密码", f.names.join("、")], ["任务", p.task], ["注入工具", p.injector], ["操作", operation], ["请求有效期", new Date(p.expires_at * 1000).toLocaleString()]]) { addText(list, "dt", label); addText(list, "dd", String(value)); }
+    // What is returned can be changed: another copy with the same name, a mock, or typed text.
+    const pickers = {};
+    if (p.kind === "use" || p.kind === "fill") for (const alias of f.names) {
+      const row = addText(card, "label", `返回给 ${alias} 的值 `), select = document.createElement("select"), manual = document.createElement("input");
+      const options = [["default", "保存的密码"], ...Object.keys((await get("secrets", alias)).copies || {}).map(l => ["copy:" + l, "副本 " + l]), ["mock", "mock：形状相同的假值，不告诉它真密码"], ["manual", "手动输入"]];
+      for (const [value, text] of options) { const o = addText(select, "option", text); o.value = value; }
+      manual.type = "password"; manual.hidden = true; manual.placeholder = "手动输入的值"; manual.autocomplete = "off";
+      select.onchange = () => { manual.hidden = select.value !== "manual"; };
+      row.append(select, manual); pickers[alias] = () => select.value === "manual" ? "manual:" + manual.value : select.value;
     }
+    const details = document.createElement("details"); addText(details, "summary", "查看完整冻结请求"); addText(details, "pre", entry.request_text); card.appendChild(details);
+    const run = async (decision, grant = null) => {
+      card.querySelectorAll("button").forEach(b => b.disabled = true);
+      try {
+        const choices = Object.fromEntries(Object.entries(pickers).map(([alias, pick]) => [alias, pick()]));
+        if (decision === "approve" && Object.values(choices).includes("manual:")) throw new Error("请填写手动输入的值。");
+        await decide(entry, p, decision, "", choices, grant); await refresh(true);
+      } catch (e) { $("message").textContent = e.message; card.querySelectorAll("button").forEach(b => b.disabled = false); }
+    };
+    addText(card, "button", "拒绝").className = "deny"; card.lastChild.onclick = () => run("deny");
+    addText(card, "button", "允许（1 次）").onclick = () => run("approve");
+    // 其他: allow the same kind of request again, n times or for a while.
+    const more = document.createElement("select");
+    for (const [value, text] of [["", "其他…"], ["t3", "允许 3 次"], ["t10", "允许 10 次"], ["s180", "允许 3 分钟"], ["s600", "允许 10 分钟"], ["s3600", "允许 1 小时"]]) { const o = addText(more, "option", text); o.value = value; }
+    more.onchange = () => { if (more.value) run("approve", more.value[0] === "t" ? {times: Number(more.value.slice(1))} : {seconds: Number(more.value.slice(1))}); };
+    card.appendChild(more);
     $("requests").appendChild(card);
   }
 }
@@ -279,4 +366,4 @@ action("refresh", () => refresh(true));
 // While the page is open and connected, new requests arrive without pressing anything.
 let polling = false;
 setInterval(async () => { if (!session || polling) return; polling = true; try { await refresh(); } catch (e) { $("message").textContent = e.message; } finally { polling = false; } }, 2000);
-get("device", "device").then(async d => { device = d; await show(); if (device) { try { await login(); await publishRules(); await refresh(true); } catch (e) {} await show(); } }).catch(e => { $("message").textContent = e.message; });
+get("device", "device").then(async d => { device = d; await show(); if (device) { try { await login(); await publishMatchers(); await refresh(true); } catch (e) {} await show(); } }).catch(e => { $("message").textContent = e.message; });
