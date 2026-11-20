@@ -75,8 +75,8 @@ def handler(broker, role):
                     raise GuardError("request_invalid")
                 if role == "agent":
                     token = self.bearer()
-                    if self.path == "/reference" and set(body) == {"alias"}:
-                        result = broker.reference(token, body["alias"])
+                    if self.path == "/reference" and set(body) in ({"alias"}, {"alias", "type"}):
+                        result = broker.reference(token, **body)
                     elif self.path == "/workflow" and set(body) == {"ref", "repo", "limit"}:
                         result = broker.workflow(token, **body)
                     elif self.path == "/status" and set(body) == {"operation_id"}:
