@@ -50,7 +50,7 @@ async function plain(secret, label = "default") {
 const MOD = (1n << 61n) - 1n;
 async function compile(alias, value, base) {
   const data = bytes(value);
-  if (data.length < 4) return null;
+  if (!data.length) return null;
   let h = 0n; for (const b of data) h = (h * base + BigInt(b)) % MOD;
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await crypto.subtle.importKey("raw", data, "PBKDF2", false, ["deriveBits"]);

@@ -4,9 +4,9 @@ The approver, which has the plaintext, turns each credential into a matcher:
 its length, a 16-bit tag of a rolling hash, and a salted PBKDF2 digest. The
 injector slides a window over text; the tag discards almost every position
 cheaply and the digest confirms a real hit. Nothing here can be decoded back
-into the credential, but a matcher is by nature a yes/no oracle: whoever can
-read it can test guesses offline, so a short or guessable credential is only
-as safe as the cost of PBKDF2 makes it. The tag itself gives away 16 bits.
+into the credential. A matcher answers yes or no for a guess, so whoever can
+read it can test guesses offline at the cost of one PBKDF2 each; the tag
+narrows guesses by 16 bits. The strength of a credential is the user's choice.
 """
 import base64
 import hashlib
@@ -15,7 +15,6 @@ import secrets
 
 MOD = (1 << 61) - 1
 ITERATIONS = 50_000
-MIN_LENGTH = 4  # Shorter values match by accident everywhere and are guessed at once.
 MAX_SCAN = 4 * 1024 * 1024
 
 
@@ -37,7 +36,8 @@ def new_base():
 def compile_one(alias, value, base):
     """One credential copy -> one matcher. `value` never leaves the caller."""
     data = value.encode()
-    if len(data) < MIN_LENGTH:
+    # How strong a credential is, is the user's decision: every value is compiled, whatever its length.
+    if not data:
         return None
     salt = secrets.token_bytes(16)
     return {"alias": alias, "length": len(data), "tag": _roll(data, base) & 0xFFFF, "salt": _b64(salt),
@@ -48,7 +48,7 @@ def valid_set(value):
     try:
         return (isinstance(value["base"], str) and 256 < int(value["base"]) < MOD and isinstance(value["matchers"], list)
                 and all(set(m) == {"alias", "length", "tag", "salt", "digest"} and isinstance(m["alias"], str)
-                        and type(m["length"]) is int and m["length"] >= MIN_LENGTH and type(m["tag"]) is int
+                        and type(m["length"]) is int and m["length"] >= 1 and type(m["tag"]) is int
                         and isinstance(m["salt"], str) and isinstance(m["digest"], str) for m in value["matchers"]))
     except Exception:
         return False

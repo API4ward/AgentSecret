@@ -118,7 +118,7 @@ class Approver:
             raise GuardError("alias_invalid")
         if not isinstance(value, str) or not value:
             raise GuardError("secret_empty")
-        if len(value.encode()) > MAX_PLAINTEXT // 4:
+        if len(value.encode()) > MAX_PLAINTEXT:
             raise GuardError("secret_too_large")
         with self.tx() as db:
             if not db.execute("SELECT 1 FROM secrets WHERE alias=? AND active=1", (alias,)).fetchone():
