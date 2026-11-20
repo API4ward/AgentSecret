@@ -193,7 +193,10 @@ class Broker:
         self.audit(db, "requested", payload["request_id"], task["id"])
         return {"operation_id": payload["request_id"], "state": "pending"}
 
-    def reference(self, token, alias):
+    def reference(self, token, alias, type="once"):
+        # The MCP tool offers `type` for the injector backend; here every reference behaves the same way.
+        if type not in ("once", "long"):
+            raise GuardError("request_invalid")
         with self.tx() as db:
             task, secret = self.task(db, token), self.secret(db, alias)
             self.policy(task, secret)

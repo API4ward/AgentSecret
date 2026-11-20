@@ -113,6 +113,12 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(GuardError):
             self.b.login("phone", c["challenge"], s)
 
+    def test_reference_accepts_the_type_the_mcp_tool_offers(self):
+        # A model fills in every field the tool schema lists; that must not fail the call.
+        self.assertEqual(self.b.reference(self.t["token"], "github", type="once")["state"], "pending")
+        with self.assertRaises(GuardError):
+            self.b.reference(self.t["token"], "github", type="forever")
+
     def test_cross_task_reference_and_status(self):
         ref = self.ref()
         other = self.b.new_task("alice", "payments")

@@ -3,9 +3,16 @@
 Only the agent is simulated: each test feeds the hook the PreToolUse / PostToolUse
 events Claude Code would send and applies what the hook answers.
 """
+import argparse
+import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
+import os
 from pathlib import Path
+import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -163,6 +170,51 @@ class ScenarioTests(unittest.TestCase):
         self.assertNotIn("18year", json.dumps(out))
         self.assertIn("withheld", out["updatedToolOutput"])
         self.assertEqual(self.hook("PreToolUse", "Write", {"file_path": "x", "content": "{{secretref:age}}"})[0], 2)
+
+    # Codex: same events, but a replaced result has to be sent as a blocked result with the new text as its reason.
+    def codex_launcher(self):
+        out = self.root / "run.codex"
+        args = argparse.Namespace(token_file=str(self.root / "run.token"), out=str(out), codex="codex", protect=[],
+                                  url=f"http://{self.server.expected_host}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.write_codex_launcher(args, str(self.root / "injector"), (args.url, args.token_file))
+        return out
+
+    def test_codex_gets_the_replaced_result_in_the_form_it_accepts(self):
+        self.secrets(age="18year")
+        text = self.codex_launcher().read_text()
+        self.assertIn("--dangerously-bypass-hook-trust", text)  # Otherwise Codex skips the hook without a word.
+        self.command = next(json.loads(re.search(r'"command"=("(?:[^"\\]|\\.)*")', c).group(1)) for c in shlex.split(text) if c.startswith("hooks.PostToolUse="))
+        event = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "cat example/qa.txt"},
+                 "tool_response": "I am 18year old.\n", "cwd": str(self.work)}
+        run = lambda: json.loads(subprocess.run(self.command, shell=True, capture_output=True, text=True, input=json.dumps(event)).stdout)
+        self.assertEqual(run(), {"decision": "block", "reason": "I am {{secretref:age}} old.\n"})
+        self.assertEqual(self.asked[-1]["kind"], "reveal")
+        self.answer = lambda item: ("deny", None, None)
+        self.assertIn("withheld", run()["reason"])
+        self.server.shutdown()  # The injector is gone: still withheld, still in Codex's form.
+        self.server.server_close()
+        out = run()
+        self.assertEqual((out["decision"], "18year" in out["reason"], "withheld" in out["reason"]), ("block", False, True))
+
+    @unittest.skipUnless(os.environ.get("AGENTSECRET_REAL_CODEX") and shutil.which("codex"), "set AGENTSECRET_REAL_CODEX=1 to run a real Codex session (needs a login and network)")
+    def test_real_codex_session_sees_a_reference_and_can_fill_it(self):
+        self.secrets(age="18year")
+        (self.work / "example/qa.txt").write_text("I am 18year old.\n")
+        launcher = self.codex_launcher()
+
+        def codex(prompt):
+            run = subprocess.run([str(launcher), "exec", "--skip-git-repo-check", prompt], cwd=self.work, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+            self.transcript = run.stderr
+            return run.stdout
+        said = codex("Run exactly this one shell command and nothing else: cat example/qa.txt  Then repeat its output verbatim.")
+        # What the model says about a replaced result varies; that it never got the credential does not.
+        self.assertIn("PostToolUse Blocked", self.transcript)
+        self.assertNotIn("18year", said)
+        self.assertEqual(self.asked[-1]["kind"], "reveal")
+        codex("Run exactly this one shell command and nothing else: printf 'The user is {{secretref:age}} old.' > answer.txt  Then say done.")
+        self.assertEqual((self.work / "answer.txt").read_text(), "The user is 18year old.")
+        self.assertEqual(self.asked[-1]["kind"], "fill")
 
     # Scenario 3: filling in configuration.
     def test_filling_deepseek_token_into_codex_config_asks_for_approval(self):
