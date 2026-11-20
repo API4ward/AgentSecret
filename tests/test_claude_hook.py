@@ -217,6 +217,7 @@ class ClaudeHookTests(unittest.TestCase):
         self.assertIn("--agent codex", text)
         self.assertIn("--dangerously-bypass-hook-trust", text)
         self.assertIn("mcp_servers.secret_guard=", text)
+        self.assertIn('"default_tools_approval_mode"="approve"', text)
         self.assertEqual(subprocess.run(["sh", "-n", out]).returncode, 0)
         again = subprocess.run([sys.executable, "-m", "secret_guard.cli", "codex-config", "--token-file", str(self.token), "--out", out], capture_output=True)
         self.assertNotEqual(again.returncode, 0)

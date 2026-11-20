@@ -90,7 +90,9 @@ def codex_overrides(token_file, protect, url="http://127.0.0.1:8765", guard=None
     # The sandbox profile is the enforcing part: Codex applies it to every shell
     # command through the OS sandbox, however the path is spelled.
     server = claude_mcp_config(token_file, url)["mcpServers"]["secret_guard"]
-    return {"mcp_servers.secret_guard": {k: server[k] for k in ("command", "args", "env")},
+    # Codex asks before every MCP tool call and `codex exec` cannot ask, so it fails them.
+    # Pre-approving is safe here: the decision that matters is signed on the approval device.
+    return {"mcp_servers.secret_guard": {**{k: server[k] for k in ("command", "args", "env")}, "default_tools_approval_mode": "approve"},
             "permissions.secret_guard.extends": ":workspace",
             "permissions.secret_guard.filesystem": {str(Path(p).expanduser().resolve()): "none" for p in protect},
             "default_permissions": "secret_guard",

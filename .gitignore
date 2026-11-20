@@ -3,3 +3,5 @@ build/
 *.egg-info/
 __pycache__/
 *.token
+e2e/.env
+e2e/out*

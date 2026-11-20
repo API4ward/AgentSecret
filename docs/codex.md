@@ -37,9 +37,9 @@ MCP bridge 由 Codex 自身在沙箱外启动，所以仍能读到 token 文件�
 
 ### 限制
 
-- **hook 已在真实 Codex 会话里实测（2026-11-20，codex-cli 0.166.0）。** 结论见下一节。
+- **hook 已在真实 Codex 会话里实测**：2026-11-19 在 Linux 容器里（见 [e2e-docker.md](e2e-docker.md)），2026-11-20 在 macOS 本机（codex-cli 0.166.0）。结论见下一节。
 - 沙箱只约束模型发起的命令。加了 `-s danger-full-access` 或 `--dangerously-bypass-approvals-and-sandbox` 就没有这层保护。交互模式下模型可以申请让某条命令脱离沙箱，批准与否由用户决定，不要批准读取受保护路径的命令。
-- 读取禁令的实测只在 macOS 上做过。Linux 上 Codex 用 Landlock 和 seccomp，未验证。
+- Linux 上 Codex 的沙箱依赖 bubblewrap 和用户命名空间。读取禁令已在 Docker 容器里实测有效，但容器要加 `--security-opt seccomp=unconfined`，否则沙箱起不来、命令无法执行。
 - 其他 MCP 服务器、Codex 的 hosted 工具不经过沙箱。
 - 沙箱和 hook 都在 agent 所在的 OS 账户内配置。有意绕过整个 Codex 的进程不在防护范围内，本产品不提供沙盒。
 
@@ -57,4 +57,4 @@ MCP bridge 由 Codex 自身在沙箱外启动，所以仍能读到 token 文件�
 
 ## 第 2 层：通过 MCP 使用密码
 
-脚本注册 `secret_guard` MCP 服务器，工具和闭环与 [README](../README.md) 相同。身份粒度是独立 MCP 进程的 broker task，每次任务单独 `task-create` 和 `codex-config`，结束后 `revoke task` 并删除 token 和脚本。
+脚本注册 `secret_guard` MCP 服务器，并设 `default_tools_approval_mode="approve"`（否则 `codex exec` 会拒绝所有 MCP 调用；真正的审批在独立设备上），工具和闭环与 [README](../README.md) 相同。身份粒度是独立 MCP 进程的 broker task，每次任务单独 `task-create` 和 `codex-config`，结束后 `revoke task` 并删除 token 和脚本。
